@@ -1,0 +1,8 @@
+storage/*
+*.log
+vendor/*
+node_modules/*  
+.env
+.DS_Store
+.idea/*
+acrynite.exe

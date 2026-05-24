@@ -4,6 +4,7 @@ go 1.22.2
 
 require (
 	github.com/AlecAivazis/survey/v2 v2.3.7
+	github.com/lib/pq v1.10.9
 	github.com/spf13/cobra v1.10.2
 )
 

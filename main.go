@@ -1,15 +1,9 @@
 package main
 
 import (
-	"fmt"
-	"os"
-
-	"acrynite-cli/internal"
+	"acrynite-cli/cmd"
 )
 
 func main() {
-	if err := internal.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
+	cmd.Execute()
 }
