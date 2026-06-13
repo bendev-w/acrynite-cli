@@ -45,6 +45,9 @@ func registerCommands() {
 
 	// add command to register db
 	rootCmd.AddCommand(dbCmd)
+
+	// add command for backups
+	rootCmd.AddCommand(backupCmd)
 }
 
 

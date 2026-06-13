@@ -117,8 +117,14 @@ func runBackup(cmd *cobra.Command, args []string) error {
 	utils.Info("Starting backup of database '%s'...", dbName)
 	utils.Info("Backup location: %s", backupFile)
 
-	// Perform the backup using pg_dump
-	if err := performPgDump(config, backupFile); err != nil {
+	// Perform the backup based on database type
+	if config.Type == "mysql" {
+		err = performMySqlDump(config, backupFile)
+	} else {
+		err = performPgDump(config, backupFile)
+	}
+	
+	if err != nil {
 		return fmt.Errorf("backup failed: %w", err)
 	}
 
@@ -181,7 +187,14 @@ func runScheduleBackup(cmd *cobra.Command, args []string) error {
 		
 		utils.Info("[Scheduled] Starting backup of '%s'...", dbName)
 		
-		if err := performPgDump(config, backupFile); err != nil {
+		var err error
+		if config.Type == "mysql" {
+			err = performMySqlDump(config, backupFile)
+		} else {
+			err = performPgDump(config, backupFile)
+		}
+		
+		if err != nil {
 			utils.Error("[Scheduled] Backup failed: %v", err)
 			return err
 		}
@@ -304,6 +317,31 @@ func performPgDump(config *database.DBConfig, outputFile string) error {
 	// Execute backup
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("pg_dump failed: %w (ensure pg_dump is installed and in PATH)", err)
+	}
+
+	return nil
+}
+
+// performMySqlDump performs a MySQL dump using mysqldump command
+func performMySqlDump(config *database.DBConfig, outputFile string) error {
+	// Build mysqldump command
+	args := []string{
+		"-h", config.Host,
+		"-P", fmt.Sprintf("%d", config.Port),
+		"-u", config.User,
+		fmt.Sprintf("-p%s", config.Password), // MySQL requires no space between -p and password
+		config.Database,
+		"--result-file=" + outputFile,
+	}
+
+	// Create command
+	cmd := exec.Command("mysqldump", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// Execute backup
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("mysqldump failed: %w (ensure mysqldump is installed and in PATH)", err)
 	}
 
 	return nil

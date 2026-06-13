@@ -1,6 +1,6 @@
 module acrynite-cli
 
-go 1.22.2
+go 1.24.0
 
 require (
 	github.com/AlecAivazis/survey/v2 v2.3.7
@@ -9,6 +9,8 @@ require (
 )
 
 require (
+	filippo.io/edwards25519 v1.2.0 // indirect
+	github.com/go-sql-driver/mysql v1.10.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51 // indirect
 	github.com/mattn/go-colorable v0.1.2 // indirect

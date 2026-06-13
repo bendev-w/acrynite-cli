@@ -14,6 +14,7 @@ import (
 
 var (
 	dbName     string
+	dbType     string
 	dbHost     string
 	dbPort     int
 	dbUser     string
@@ -29,17 +30,18 @@ var (
 var dbCmd = &cobra.Command{
 	Use:   "db",
 	Short: "Manage database connections",
-	Long:  `Manage PostgreSQL database connections. Register, list, and test database configurations.`,
+	Long:  `Manage PostgreSQL and MySQL database connections. Register, list, and test database configurations.`,
 }
 
 // dbRegisterCmd handles database registration
 var dbRegisterCmd = &cobra.Command{
 	Use:   "register",
 	Short: "Register a new database",
-	Long: `Register a new PostgreSQL database configuration with the CLI.
+	Long: `Register a new PostgreSQL or MySQL database configuration with the CLI.
 The configuration will be stored locally and can be used for backups and operations.`,
 	Example: `  acrynite db register \
     --name production-db \
+    --type postgres \
     --host localhost \
     --port 5432 \
     --user postgres \
@@ -130,12 +132,13 @@ func init() {
 
 	// Register command flags
 	dbRegisterCmd.Flags().StringVar(&dbName, "name", "", "Unique database identifier (required)")
+	dbRegisterCmd.Flags().StringVar(&dbType, "type", "postgres", "Database type (postgres or mysql)")
 	dbRegisterCmd.Flags().StringVar(&dbHost, "host", "", "Database host (required)")
-	dbRegisterCmd.Flags().IntVar(&dbPort, "port", 5432, "Database port")
+	dbRegisterCmd.Flags().IntVar(&dbPort, "port", 0, "Database port (default: 5432 for postgres, 3306 for mysql)")
 	dbRegisterCmd.Flags().StringVar(&dbUser, "user", "", "Database user (required)")
 	dbRegisterCmd.Flags().StringVar(&dbPassword, "password", "", "Database password (required)")
 	dbRegisterCmd.Flags().StringVar(&dbDatabase, "database", "", "Database name (required)")
-	dbRegisterCmd.Flags().StringVar(&dbSSLMode, "ssl-mode", "disable", "SSL mode (disable, require, verify-ca, verify-full)")
+	dbRegisterCmd.Flags().StringVar(&dbSSLMode, "ssl-mode", "disable", "SSL mode for PostgreSQL (disable, require, verify-ca, verify-full)")
 
 	// Update command flags
 	dbUpdateCmd.Flags().StringVar(&dbName, "name", "", "New database identifier")
@@ -166,9 +169,21 @@ func runDBRegister(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Set default port based on database type if not specified
+	if dbPort == 0 {
+		if dbType == "mysql" {
+			dbPort = 3306
+		} else {
+			dbPort = 5432
+		}
+	}
+
 	// Validate required fields
 	if dbName == "" {
 		return fmt.Errorf("database name is required")
+	}
+	if dbType != "postgres" && dbType != "mysql" {
+		return fmt.Errorf("database type must be 'postgres' or 'mysql'")
 	}
 	if dbHost == "" {
 		return fmt.Errorf("host is required")
@@ -184,7 +199,7 @@ func runDBRegister(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create configuration
-	config := database.NewDBConfig(dbName, dbHost, dbPort, dbUser, dbPassword, dbDatabase, dbSSLMode)
+	config := database.NewDBConfig(dbName, dbType, dbHost, dbPort, dbUser, dbPassword, dbDatabase, dbSSLMode)
 
 	// Register the database
 	utils.Info("Registering database: %s", dbName)
@@ -230,8 +245,8 @@ func runDBList(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(w, "NAME\tHOST\tPORT\tDATABASE\tUSER\tSTATUS")
-	fmt.Fprintln(w, "----\t----\t----\t--------\t----\t------")
+	fmt.Fprintln(w, "NAME\tTYPE\tHOST\tPORT\tDATABASE\tUSER\tSTATUS")
+	fmt.Fprintln(w, "----\t----\t----\t----\t--------\t----\t------")
 
 	for _, config := range configs {
 		status := "✓ Active"
@@ -239,8 +254,9 @@ func runDBList(cmd *cobra.Command, args []string) error {
 			status = "○ Inactive"
 		}
 
-		fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\t%s\n",
+		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%s\t%s\n",
 			config.Name,
+			config.Type,
 			config.Host,
 			config.Port,
 			config.Database,
@@ -280,6 +296,14 @@ func promptDatabaseDetails() error {
 			Validate: survey.Required,
 		},
 		{
+			Name: "type",
+			Prompt: &survey.Select{
+				Message: "Database type:",
+				Options: []string{"postgres", "mysql"},
+				Default: "postgres",
+			},
+		},
+		{
 			Name: "host",
 			Prompt: &survey.Input{
 				Message: "Database host:",
@@ -292,6 +316,7 @@ func promptDatabaseDetails() error {
 			Prompt: &survey.Input{
 				Message: "Database port:",
 				Default: "5432",
+				Help:    "Default: 5432 for PostgreSQL, 3306 for MySQL",
 			},
 			Validate: survey.Required,
 		},
@@ -320,7 +345,7 @@ func promptDatabaseDetails() error {
 		{
 			Name: "sslmode",
 			Prompt: &survey.Select{
-				Message: "SSL mode:",
+				Message: "SSL mode (PostgreSQL only):",
 				Options: []string{"disable", "require", "verify-ca", "verify-full"},
 				Default: "disable",
 			},
@@ -329,6 +354,7 @@ func promptDatabaseDetails() error {
 
 	answers := struct {
 		Name     string
+		Type     string
 		Host     string
 		Port     string
 		User     string
@@ -342,9 +368,17 @@ func promptDatabaseDetails() error {
 	}
 
 	dbName = answers.Name
+	dbType = answers.Type
 	dbHost = answers.Host
-	dbPort = 5432
+	dbPort = 0
 	fmt.Sscanf(answers.Port, "%d", &dbPort)
+	if dbPort == 0 {
+		if answers.Type == "mysql" {
+			dbPort = 3306
+		} else {
+			dbPort = 5432
+		}
+	}
 	dbUser = answers.User
 	dbPassword = answers.Password
 	dbDatabase = answers.Database
@@ -357,11 +391,14 @@ func displayDatabaseInfo(config *database.DBConfig) {
 	fmt.Println("Database Configuration:")
 	fmt.Println(strings.Repeat("=", 50))
 	fmt.Printf("  Name:           %s\n", config.Name)
+	fmt.Printf("  Type:           %s\n", config.Type)
 	fmt.Printf("  Host:           %s\n", config.Host)
 	fmt.Printf("  Port:           %d\n", config.Port)
 	fmt.Printf("  Database:       %s\n", config.Database)
 	fmt.Printf("  User:           %s\n", config.User)
-	fmt.Printf("  SSL Mode:       %s\n", config.SSLMode)
+	if config.Type == "postgres" {
+		fmt.Printf("  SSL Mode:       %s\n", config.SSLMode)
+	}
 	fmt.Printf("  Status:         %s\n", func() string {
 		if config.IsActive {
 			return "Active"
@@ -439,6 +476,7 @@ func runDBUpdate(cmd *cobra.Command, args []string) error {
 
 	// Create a new config based on existing
 	newName := existingConfig.Name
+	newType := existingConfig.Type
 	newHost := existingConfig.Host
 	newPort := existingConfig.Port
 	newUser := existingConfig.User
@@ -501,7 +539,7 @@ func runDBUpdate(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create updated configuration
-	updatedConfig := database.NewDBConfig(newName, newHost, newPort, newUser, newPassword, newDatabase, newSSLMode)
+	updatedConfig := database.NewDBConfig(newName, newType, newHost, newPort, newUser, newPassword, newDatabase, newSSLMode)
 	updatedConfig.CreatedAt = existingConfig.CreatedAt
 	
 	if flags.Changed("host") || flags.Changed("port") || flags.Changed("user") || 

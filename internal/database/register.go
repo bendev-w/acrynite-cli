@@ -1,6 +1,7 @@
 package database
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"sync"
@@ -223,7 +224,15 @@ func (cm *ConfigManager) TestConnection(name string) error {
 
 	utils.Info("Testing connection to '%s'...", name)
 
-	db, err := ConnectPostgresDB(config.ConnectionString())
+	var db *sql.DB
+	
+	// Choose connection function based on database type
+	if config.Type == "mysql" {
+		db, err = ConnectMySQLDB(config.ConnectionString())
+	} else {
+		db, err = ConnectPostgresDB(config.ConnectionString())
+	}
+	
 	cm.mu.Lock()
 	config.LastTested = time.Now()
 	if err != nil {
