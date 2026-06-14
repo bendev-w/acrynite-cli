@@ -159,8 +159,8 @@ Example:
 acrynite backup schedule [database-name] [flags]
 
 Flags:
-  --interval string    Backup frequency: hourly, daily, weekly, or duration (e.g., 30m, 2h, 24h) (required)
-  --path string        Path to store backup files (required)
+  --interval string    Backup frequency: hourly, daily, weekly, or custom duration (e.g., 30m, 2h, 24h) (default: daily)
+  --path string        Path to store backup files (default: ./backups)
 
 Example:
   acrynite backup schedule production-db --interval daily --path ./backups
@@ -168,14 +168,19 @@ Example:
   acrynite backup schedule test-db --interval weekly --path ./backups
 ```
 
-**List Schedules:**
+✅ **Note:** When you schedule a backup, the scheduler daemon automatically starts in the background and executes backups according to the interval.
+
+**List Scheduled Backups:**
 ```bash
-acrynite backup schedules
+acrynite backup list
 ```
 
-**Remove Schedule:**
+**Cancel a Scheduled Backup:**
 ```bash
-acrynite backup remove-schedule [schedule-id]
+acrynite backup cancel [schedule-id]
+
+Example:
+  acrynite backup cancel backup-production-db-20260614_094714
 ```
 
 #### Version
@@ -186,8 +191,9 @@ Display version information:
 acrynite version
 ```
 
-## Configuration
+## Configuration & Storage
 
+### Database Configuration
 Database configurations are stored locally in your system's configuration directory:
 
 - **Linux/macOS:** `~/.acrynite-cli/databases.json`
@@ -203,31 +209,53 @@ acrynite db export --file backup-configs.json
 acrynite db import --file backup-configs.json
 ```
 
+### Schedule Management
+Scheduled backups are stored in:
+- **Linux/macOS:** `~/.acrynite-cli/storage/schedules/schedules.json`
+- **Windows:** `%APPDATA%\acrynite-cli\storage\schedules\schedules.json`
+
+### Backup Files
+Backup files are stored in the path you specify during scheduling:
+```bash
+# Default location
+./backups/
+
+# Files are named: [database-name]_[timestamp].sql
+# Example: production-db_20260614-093729.sql
+```
+
 ## Architecture
 
 ```
 acrynite-cli/
-├── cmd/                 # CLI command definitions
-│   ├── backup.go       # Backup command logic
-│   ├── command.go      # Root command setup
-│   ├── db.go           # Database management commands
-│   └── version.go      # Version command
-├── internal/           # Internal packages
-│   ├── backup/         # Backup implementation
-│   ├── config/         # Configuration management
-│   ├── cron/           # Scheduling logic
-│   └── database/       # Database connectivity
-├── storage/            # Local storage
-│   ├── backups/        # Backup files
-│   ├── configs/        # Configuration files
-│   ├── logs/           # Application logs
-│   └── schedules/      # Schedule metadata
-├── utils/              # Utility functions
-│   ├── filesystem.go   # File operations
-│   ├── logger.go       # Logging utilities
-│   ├── scheduler.go    # Scheduling utilities
-│   └── timestamp.go    # Time utilities
-└── main.go             # Entry point
+├── cmd/                    # CLI command definitions
+│   ├── backup.go          # Backup command logic
+│   ├── command.go         # Root command setup
+│   ├── db.go              # Database management commands
+│   └── version.go         # Version command
+├── internal/              # Internal packages
+│   ├── backup/            # Backup implementation
+│   │   └── full.go        # Full backup operations
+│   ├── schedule/          # Schedule management
+│   │   ├── persistence.go # Schedule persistence layer
+│   │   └── manager.go     # Schedule manager & daemon
+│   ├── config/            # Configuration management
+│   ├── database/          # Database connectivity
+│   │   ├── connect.go     # Connection handling
+│   │   ├── register.go    # Registration logic
+│   │   └── types.go       # Data types
+│   └── cron/              # (Legacy scheduling)
+├── storage/               # Local storage
+│   ├── backups/           # Backup files
+│   ├── configs/           # Configuration files (databases.json)
+│   ├── logs/              # Application logs
+│   └── schedules/         # Schedule metadata & PID tracking
+├── utils/                 # Utility functions
+│   ├── filesystem.go      # File operations
+│   ├── logger.go          # Logging utilities
+│   ├── scheduler.go       # In-memory task scheduling
+│   └── timestamp.go       # Time utilities
+└── main.go                # Entry point
 ```
 
 ## Development
@@ -255,50 +283,99 @@ go build -o acrynite
 - `github.com/lib/pq` - PostgreSQL driver
 - `github.com/go-sql-driver/mysql` - MySQL driver
 
+## Scheduler Daemon
+
+When you schedule a backup using `acrynite backup schedule`, a background scheduler daemon automatically starts. The daemon:
+
+- ✅ Runs continuously in the background
+- ✅ Checks for overdue schedules every 30 seconds
+- ✅ Automatically executes backups when they're due
+- ✅ Updates backup history and error tracking
+- ✅ Persists all schedule data to disk
+
+The daemon runs independently of the CLI process, so scheduled backups will execute even if you close the terminal.
+
 ## Common Use Cases
 
-### Daily Backups
+### Schedule Daily Backups
 ```bash
-# Schedule a daily backup at the default time
+# Register a production database
+acrynite db register --name production-db --type postgres \
+  --host db.example.com --port 5432 \
+  --user postgres --password secret --database myapp
+
+# Schedule daily backups (daemon starts automatically)
 acrynite backup schedule production-db --interval daily --path /backups/production
+```
+
+### Schedule Backups at Custom Intervals
+```bash
+# Every 6 hours
+acrynite backup schedule production-db --interval 6h --path /backups/production
+
+# Every 30 minutes
+acrynite backup schedule dev-db --interval 30m --path /backups/dev
+
+# Every week
+acrynite backup schedule backup-db --interval weekly --path /backups/weekly
 ```
 
 ### Multiple Database Backups
 ```bash
 # Register multiple databases
-acrynite db register --name prod-main ...
-acrynite db register --name prod-cache ...
+acrynite db register --name prod-main --type postgres ...
+acrynite db register --name prod-cache --type mysql ...
 
-# Schedule backups for each
+# Schedule backups for each (daemons start automatically)
 acrynite backup schedule prod-main --interval daily --path /backups
 acrynite backup schedule prod-cache --interval daily --path /backups
+
+# List all scheduled backups
+acrynite backup list
 ```
 
-### Backup Migration
+### Backup Configuration Migration
 ```bash
 # Export configs from one machine
 acrynite db export --file configs.json
 
 # Import on another machine
 acrynite db import --file configs.json
+
+# Re-schedule if needed on the new machine
+acrynite backup schedule prod-db --interval daily --path /backups
 ```
 
 ## Troubleshooting
 
-**Connection Failed:**
+### Connection Failed
 - Verify database credentials with `acrynite db test [database-name]`
 - Check if the database host and port are correct
 - Ensure network connectivity to the database server
+- Confirm username and password are correct
 
-**Backup Failed:**
-- Verify the backup path exists and has write permissions
-- Check available disk space
-- Review logs for detailed error messages
+### Backup Failed
+- Verify the backup path exists and has write permissions: `mkdir -p /backups`
+- Check available disk space: `df -h`
+- Verify database credentials with `acrynite db test`
+- Review error messages with `--verbose` flag for details
 
-**Schedule Not Running:**
-- Ensure the application remains running for scheduled tasks to execute
-- Check system logs for errors
-- Verify the schedule was created with `acrynite backup schedules`
+### Schedule Not Executing
+- The scheduler daemon runs automatically, no manual action needed
+- Verify the schedule was created: `acrynite backup list`
+- Check the PID file exists: `~/.acrynite-cli/storage/schedules/.daemon.pid`
+- View recent backups to confirm execution occurred
+- On Windows, ensure the process has necessary permissions
+
+### Missing Backup Files
+- Verify the correct path was specified: `acrynite backup list`
+- Check if the directory has write permissions
+- Ensure `pg_dump` (PostgreSQL) or `mysqldump` (MySQL) is installed and in PATH
+
+### Schedule Takes Too Long
+- The scheduler checks every 30 seconds, so backups start within 30 seconds of their scheduled time
+- Large databases may take several minutes to backup
+- Use `acrynite backup list` to check `Last run` time and status
 
 ## Contributing
 
