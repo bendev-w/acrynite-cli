@@ -2,13 +2,14 @@ package cmd
 
 import (
 	"fmt"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"time"
 
+	"acrynite-cli/internal/backup"
 	"acrynite-cli/internal/database"
+	"acrynite-cli/internal/schedule"
 	"acrynite-cli/utils"
+
 	"github.com/spf13/cobra"
 )
 
@@ -66,12 +67,21 @@ var backupCancelCmd = &cobra.Command{
 	RunE:  runCancelBackup,
 }
 
+// backupSchedulerCmd runs the backup scheduler daemon
+var backupSchedulerCmd = &cobra.Command{
+	Use:    "scheduler",
+	Short:  "Run backup scheduler daemon (runs continuously in background)",
+	Hidden: true, // Hidden from help - started automatically
+	RunE:   runSchedulerDaemon,
+}
+
 func init() {
 	// Add subcommands
 	backupCmd.AddCommand(backupRunCmd)
 	backupCmd.AddCommand(backupScheduleCmd)
 	backupCmd.AddCommand(backupListCmd)
 	backupCmd.AddCommand(backupCancelCmd)
+	backupCmd.AddCommand(backupSchedulerCmd)
 
 	// Backup run flags
 	backupRunCmd.Flags().StringVar(&backupPath, "path", "./backups", "Path to store backup files")
@@ -83,62 +93,7 @@ func init() {
 
 func runBackup(cmd *cobra.Command, args []string) error {
 	dbName := args[0]
-
-	// Get database configuration
-	manager, err := database.GetConfigManager()
-	if err != nil {
-		return fmt.Errorf("failed to get config manager: %w", err)
-	}
-
-	config, err := manager.Get(dbName)
-	if err != nil {
-		return fmt.Errorf("database '%s' not found: %w", dbName, err)
-	}
-
-	// Check if database is active
-	if !config.IsActive {
-		utils.Warning("Database '%s' is not active. Testing connection first...", dbName)
-		if err := manager.TestConnection(dbName); err != nil {
-			return fmt.Errorf("connection test failed: %w", err)
-		}
-		utils.Success("Connection successful!")
-		fmt.Println()
-	}
-
-	// Ensure backup directory exists
-	if err := utils.EnsureDirExists(backupPath); err != nil {
-		return fmt.Errorf("failed to create backup directory: %w", err)
-	}
-
-	// Generate backup filename with timestamp
-	timestamp := utils.Now(utils.TimestampBackup)
-	backupFile := filepath.Join(backupPath, fmt.Sprintf("%s_%s.sql", dbName, timestamp))
-
-	utils.Info("Starting backup of database '%s'...", dbName)
-	utils.Info("Backup location: %s", backupFile)
-
-	// Perform the backup based on database type
-	if config.Type == "mysql" {
-		err = performMySqlDump(config, backupFile)
-	} else {
-		err = performPgDump(config, backupFile)
-	}
-	
-	if err != nil {
-		return fmt.Errorf("backup failed: %w", err)
-	}
-
-	// Get file size
-	fileSize, err := utils.GetFileSize(backupFile)
-	if err != nil {
-		utils.Warning("Could not get backup file size: %v", err)
-	} else {
-		utils.Success("Backup completed successfully!")
-		utils.Info("Backup file: %s", backupFile)
-		utils.Info("Backup size: %.2f MB", float64(fileSize)/(1024*1024))
-	}
-
-	return nil
+	return backup.PerformBackup(dbName, backupPath)
 }
 
 func runScheduleBackup(cmd *cobra.Command, args []string) error {
@@ -169,7 +124,7 @@ func runScheduleBackup(cmd *cobra.Command, args []string) error {
 	}
 
 	// Parse interval
-	interval, err := parseInterval(backupInterval)
+	interval, err := backup.ParseInterval(backupInterval)
 	if err != nil {
 		return fmt.Errorf("invalid interval: %w", err)
 	}
@@ -184,21 +139,21 @@ func runScheduleBackup(cmd *cobra.Command, args []string) error {
 	backupTask := func() error {
 		timestamp := utils.Now(utils.TimestampBackup)
 		backupFile := filepath.Join(backupPath, fmt.Sprintf("%s_%s.sql", dbName, timestamp))
-		
+
 		utils.Info("[Scheduled] Starting backup of '%s'...", dbName)
-		
+
 		var err error
 		if config.Type == "mysql" {
-			err = performMySqlDump(config, backupFile)
+			err = backup.PerformMySQLDump(config, backupFile)
 		} else {
-			err = performPgDump(config, backupFile)
+			err = backup.PerformPostgresDump(config, backupFile)
 		}
-		
+
 		if err != nil {
 			utils.Error("[Scheduled] Backup failed: %v", err)
 			return err
 		}
-		
+
 		fileSize, _ := utils.GetFileSize(backupFile)
 		utils.Success("[Scheduled] Backup completed: %s (%.2f MB)", backupFile, float64(fileSize)/(1024*1024))
 		return nil
@@ -213,7 +168,26 @@ func runScheduleBackup(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to schedule backup: %w", err)
 	}
 
-	// Start scheduler if not running
+	// Save schedule to persistence
+	scheduleManager := getOrCreateScheduleManager()
+	if err := scheduleManager.AddSchedule(scheduleID, dbName, interval, backupPath); err != nil {
+		utils.Warning("Failed to persist schedule: %v", err)
+		// Don't fail the entire operation if persistence fails, but warn the user
+	}
+
+	// Start daemon if not already running
+	if !scheduleManager.IsDaemonRunning() {
+		utils.Info("Starting backup scheduler daemon...")
+		if err := scheduleManager.StartDaemon(); err != nil {
+			utils.Warning("Failed to start daemon: %v", err)
+		} else {
+			utils.Success("Scheduler daemon started successfully!")
+		}
+	} else {
+		utils.Info("Scheduler daemon is already running")
+	}
+
+	// Start scheduler if not running (for in-memory scheduling if needed)
 	scheduler.Start()
 
 	utils.Success("Backup scheduled successfully!")
@@ -222,7 +196,7 @@ func runScheduleBackup(cmd *cobra.Command, args []string) error {
 	utils.Info("Output path: %s", backupPath)
 	utils.Info("Schedule ID: %s", scheduleID)
 	utils.Info("Next backup: %s", utils.FormatTimestamp(task.NextRun, utils.TimestampLog))
-	
+
 	fmt.Println()
 	utils.Info("Note: Scheduled backups run while the CLI is active.")
 	utils.Info("To cancel this schedule, run: acrynite backup cancel %s", scheduleID)
@@ -231,48 +205,44 @@ func runScheduleBackup(cmd *cobra.Command, args []string) error {
 }
 
 func runListBackups(cmd *cobra.Command, args []string) error {
-	scheduler := getOrCreateScheduler()
-	tasks := scheduler.ListTasks()
+	manager := getOrCreateScheduleManager()
 
-	// Filter backup tasks
-	var backupTasks []*utils.Task
-	for _, task := range tasks {
-		if len(task.ID) > 7 && task.ID[:7] == "backup-" {
-			backupTasks = append(backupTasks, task)
-		}
+	// Execute any overdue schedules first
+	if err := manager.ExecuteOverdueSchedules(); err != nil {
+		utils.Warning("Failed to execute overdue schedules: %v", err)
 	}
 
-	if len(backupTasks) == 0 {
+	schedules, err := manager.GetSchedules()
+	if err != nil {
+		return fmt.Errorf("failed to load schedules: %w", err)
+	}
+
+	if len(schedules) == 0 {
 		utils.Info("No scheduled backups")
 		utils.Info("Schedule a backup with: acrynite backup schedule <database-name> --interval <interval> --path <path>")
 		return nil
 	}
 
-	utils.Info("Scheduled Backups (%d):", len(backupTasks))
+	utils.Info("Scheduled Backups (%d):", len(schedules))
 	fmt.Println()
 
-	for _, task := range backupTasks {
-		fmt.Printf("  Schedule ID: %s\n", task.ID)
-		fmt.Printf("  Name:        %s\n", task.Name)
-		fmt.Printf("  Description: %s\n", task.Description)
-		fmt.Printf("  Status:      %s\n", task.Status)
-		fmt.Printf("  Interval:    %s\n", task.Schedule)
-		
-		if !task.NextRun.IsZero() && task.Status == utils.TaskPending {
-			fmt.Printf("  Next run:    %s (%s)\n", 
-				utils.FormatTimestamp(task.NextRun, utils.TimestampLog),
-				utils.TimeAgo(task.NextRun))
-		}
-		
-		fmt.Printf("  Run count:   %d\n", task.RunCount)
-		fmt.Printf("  Errors:      %d\n", task.ErrorCount)
-		
-		if !task.LastRun.IsZero() {
+	for _, scheduleData := range schedules {
+		fmt.Printf("  Schedule ID: %s\n", scheduleData.ID)
+		fmt.Printf("  Database:    %s\n", scheduleData.Database)
+		fmt.Printf("  Interval:    %s\n", scheduleData.Interval)
+		fmt.Printf("  Output path: %s\n", scheduleData.Path)
+		fmt.Printf("  Created:     %s\n", utils.FormatTimestamp(scheduleData.CreatedAt, utils.TimestampLog))
+		fmt.Printf("  Run count:   %d\n", scheduleData.RunCount)
+		fmt.Printf("  Errors:      %d\n", scheduleData.ErrorCount)
+
+		if !scheduleData.LastRunTime.IsZero() {
 			fmt.Printf("  Last run:    %s (%s)\n",
-				utils.FormatTimestamp(task.LastRun, utils.TimestampLog),
-				utils.TimeAgo(task.LastRun))
+				utils.FormatTimestamp(scheduleData.LastRunTime, utils.TimestampLog),
+				utils.TimeAgo(scheduleData.LastRunTime))
+		} else {
+			fmt.Printf("  Last run:    Never\n")
 		}
-		
+
 		fmt.Println()
 	}
 
@@ -283,8 +253,13 @@ func runCancelBackup(cmd *cobra.Command, args []string) error {
 	scheduleID := args[0]
 
 	scheduler := getOrCreateScheduler()
-	
-	if err := scheduler.RemoveTask(scheduleID); err != nil {
+
+	// Try to remove from in-memory scheduler (if running)
+	_ = scheduler.RemoveTask(scheduleID)
+
+	// Remove from persistence
+	manager := getOrCreateScheduleManager()
+	if err := manager.RemoveSchedule(scheduleID); err != nil {
 		return fmt.Errorf("failed to cancel backup: %w", err)
 	}
 
@@ -292,85 +267,32 @@ func runCancelBackup(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// performPgDump performs a PostgreSQL dump using pg_dump command
-func performPgDump(config *database.DBConfig, outputFile string) error {
-	// Set environment variable for password
-	env := os.Environ()
-	env = append(env, fmt.Sprintf("PGPASSWORD=%s", config.Password))
+func runSchedulerDaemon(cmd *cobra.Command, args []string) error {
+	manager := getOrCreateScheduleManager()
+	checkInterval := 30 * time.Second // Check every 30 seconds for overdue schedules
 
-	// Build pg_dump command
-	args := []string{
-		"-h", config.Host,
-		"-p", fmt.Sprintf("%d", config.Port),
-		"-U", config.User,
-		"-d", config.Database,
-		"-F", "p", // Plain text format
-		"-f", outputFile,
-	}
+	utils.Info("Backup scheduler daemon started")
+	utils.Info("Checking for scheduled backups every %v", checkInterval)
+	fmt.Println()
 
-	// Create command
-	cmd := exec.Command("pg_dump", args...)
-	cmd.Env = env
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
 
-	// Execute backup
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("pg_dump failed: %w (ensure pg_dump is installed and in PATH)", err)
+	for range ticker.C {
+		// Execute any overdue schedules
+		if err := manager.ExecuteOverdueSchedules(); err != nil {
+			utils.Error("Error executing overdue schedules: %v", err)
+		}
 	}
 
 	return nil
-}
-
-// performMySqlDump performs a MySQL dump using mysqldump command
-func performMySqlDump(config *database.DBConfig, outputFile string) error {
-	// Build mysqldump command
-	args := []string{
-		"-h", config.Host,
-		"-P", fmt.Sprintf("%d", config.Port),
-		"-u", config.User,
-		fmt.Sprintf("-p%s", config.Password), // MySQL requires no space between -p and password
-		config.Database,
-		"--result-file=" + outputFile,
-	}
-
-	// Create command
-	cmd := exec.Command("mysqldump", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	// Execute backup
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("mysqldump failed: %w (ensure mysqldump is installed and in PATH)", err)
-	}
-
-	return nil
-}
-
-// parseInterval converts interval string to time.Duration
-func parseInterval(interval string) (time.Duration, error) {
-	switch interval {
-	case "hourly":
-		return time.Hour, nil
-	case "daily":
-		return 24 * time.Hour, nil
-	case "weekly":
-		return 7 * 24 * time.Hour, nil
-	default:
-		// Try parsing as duration
-		duration, err := time.ParseDuration(interval)
-		if err != nil {
-			return 0, fmt.Errorf("invalid interval '%s' (use: hourly, daily, weekly, or duration like 30m, 6h, 24h)", interval)
-		}
-		if duration < time.Minute {
-			return 0, fmt.Errorf("interval must be at least 1 minute")
-		}
-		return duration, nil
-	}
 }
 
 // Global scheduler instance
 var globalScheduler *utils.Scheduler
+
+// Global schedule manager
+var globalScheduleManager *schedule.Manager
 
 // getOrCreateScheduler returns the global scheduler instance
 func getOrCreateScheduler() *utils.Scheduler {
@@ -378,4 +300,13 @@ func getOrCreateScheduler() *utils.Scheduler {
 		globalScheduler = utils.NewScheduler(10 * time.Second) // Check every 10 seconds
 	}
 	return globalScheduler
+}
+
+// getOrCreateScheduleManager returns the global schedule manager
+func getOrCreateScheduleManager() *schedule.Manager {
+	if globalScheduleManager == nil {
+		storageDir := filepath.Join("storage", "schedules")
+		globalScheduleManager = schedule.NewManager(storageDir)
+	}
+	return globalScheduleManager
 }
