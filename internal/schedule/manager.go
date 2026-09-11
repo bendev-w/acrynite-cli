@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"acrynite-cli/internal/backup"
+	"acrynite-cli/internal/location"
 	"acrynite-cli/utils"
 )
 
@@ -44,7 +45,7 @@ func (m *Manager) ExecuteOverdueSchedules() error {
 		// Check if schedule is overdue
 		if now.After(nextRunTime) {
 			utils.Info("Executing overdue backup: %s (Schedule ID: %s)", scheduleData.Database, scheduleID)
-			err := backup.PerformBackup(scheduleData.Database, scheduleData.Path)
+			err := m.executeScheduledBackup(scheduleData)
 
 			// Update schedule with run results
 			runCount := scheduleData.RunCount + 1
@@ -63,6 +64,49 @@ func (m *Manager) ExecuteOverdueSchedules() error {
 		}
 	}
 
+	return nil
+}
+
+func (m *Manager) executeScheduledBackup(scheduleData *ScheduleData) error {
+	locMgr, err := location.GetConfigManager()
+	if err != nil {
+		return fmt.Errorf("failed to get location manager: %w", err)
+	}
+
+	var target *location.Config
+	for _, loc := range locMgr.ListByDatabase(scheduleData.Database) {
+		if loc.ScheduleID == scheduleData.ID {
+			target = loc
+			break
+		}
+	}
+
+	if target == nil || target.Type == location.TypeLocal {
+		return backup.PerformBackup(scheduleData.Database, scheduleData.Path)
+	}
+
+	if err := backup.PerformBackup(scheduleData.Database, scheduleData.Path); err != nil {
+		return err
+	}
+
+	staged := &location.Config{
+		Name:     target.Name + "-staging",
+		Database: scheduleData.Database,
+		Type:     location.TypeLocal,
+		Path:     scheduleData.Path,
+	}
+	ref, err := staged.FindLatestBackup(scheduleData.Database)
+	if err != nil {
+		return fmt.Errorf("failed to find staged backup: %w", err)
+	}
+
+	uploaded, err := target.UploadBackup(ref.Identifier, scheduleData.Database)
+	if err != nil {
+		return err
+	}
+	_ = os.Remove(ref.Identifier)
+	_ = locMgr.TouchLastBackup(scheduleData.Database, target.Name, time.Now())
+	utils.Success("Uploaded scheduled backup '%s' to %s location '%s'", uploaded.Name, target.Type, target.Name)
 	return nil
 }
 

@@ -28,15 +28,22 @@ type Config struct {
 	Type         Type      `json:"type"`
 	Provider     string    `json:"provider,omitempty"`  // provider name, for gdrive/s3
 	Path         string    `json:"path,omitempty"`      // local backup directory
-	FolderID     string    `json:"folder_id,omitempty"` // gdrive folder id (future use)
-	Bucket       string    `json:"bucket,omitempty"`    // s3 bucket (future use)
-	Prefix       string    `json:"prefix,omitempty"`    // s3 key prefix (future use)
+	FolderID     string    `json:"folder_id,omitempty"` // resolved gdrive destination folder
+	Prefix       string    `json:"prefix,omitempty"`    // s3 key prefix (defaults to the database name)
 	Source       Source    `json:"source"`
 	ScheduleID   string    `json:"schedule_id,omitempty"`
 	Active       bool      `json:"active"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 	LastBackupAt time.Time `json:"last_backup_at,omitempty"`
+}
+
+// BackupRef identifies a single backup within a location: Name is the human-readable
+// filename (used for chronological sorting/display), and Identifier is whatever the
+// backend needs to fetch it again (a local path, an S3 object key, or a Drive file ID).
+type BackupRef struct {
+	Name       string `json:"name"`
+	Identifier string `json:"identifier"`
 }
 
 // Store is the on-disk representation of all locations, keyed by "database/name".

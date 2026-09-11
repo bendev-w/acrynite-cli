@@ -2,12 +2,14 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"time"
 
 	"acrynite-cli/internal/backup"
 	"acrynite-cli/internal/database"
 	"acrynite-cli/internal/location"
+	"acrynite-cli/internal/provider"
 	"acrynite-cli/internal/restore"
 	"acrynite-cli/internal/schedule"
 	"acrynite-cli/utils"
@@ -26,11 +28,13 @@ var (
 	customRestorePath string
 	expectedTypeFlag  string
 
-	locationName        string
-	locationType        string
-	locationSource      string
-	restoreSchedule     string
-	restoreSourceFilter string
+	locationName         string
+	locationType         string
+	locationSource       string
+	locationProviderFlag string
+	locationPrefixFlag   string
+	restoreSchedule      string
+	restoreSourceFilter  string
 )
 
 // backupCmd represents the backup command
@@ -150,12 +154,15 @@ func init() {
 
 	// Backup run flags
 	backupRunCmd.Flags().StringVar(&backupPath, "path", "./backups", "Path to store backup files")
+	backupRunCmd.Flags().StringVar(&locationName, "location", "", "Upload to this registered location instead of keeping the backup locally")
 
 	// Backup schedule flags
 	backupScheduleCmd.Flags().StringVar(&backupInterval, "interval", "daily", "Backup interval (hourly, daily, weekly, or custom duration like 6h, 30m)")
-	backupScheduleCmd.Flags().StringVar(&backupPath, "path", "./backups", "Path to store backup files")
+	backupScheduleCmd.Flags().StringVar(&backupPath, "path", "./backups", "Path to store backup files (local locations only)")
 	backupScheduleCmd.Flags().StringVar(&locationName, "name", "", "Label for the location this schedule writes to (defaults to an auto-generated name)")
-	backupScheduleCmd.Flags().StringVar(&locationType, "type", "local", "Location type: only 'local' is supported until cloud provider SDK integration lands")
+	backupScheduleCmd.Flags().StringVar(&locationType, "type", "local", "Location type: local, s3, or gdrive")
+	backupScheduleCmd.Flags().StringVar(&locationProviderFlag, "provider", "", "Registered provider name (required for --type=s3 or --type=gdrive)")
+	backupScheduleCmd.Flags().StringVar(&locationPrefixFlag, "prefix", "", "S3 key prefix for this location (defaults to the database name)")
 
 	// Backup unschedule flags
 	backupUnscheduleCmd.Flags().StringVar(&locationName, "name", "", "Label of the location whose schedule should be stopped (required)")
@@ -163,8 +170,10 @@ func init() {
 
 	// Backup register flags
 	backupRegisterCmd.Flags().StringVar(&locationName, "name", "", "Label for this location (required)")
-	backupRegisterCmd.Flags().StringVar(&locationType, "type", "local", "Location type: only 'local' is supported until cloud provider SDK integration lands")
-	backupRegisterCmd.Flags().StringVar(&backupPath, "path", "./backups", "Path where backups for this location are stored")
+	backupRegisterCmd.Flags().StringVar(&locationType, "type", "local", "Location type: local, s3, or gdrive")
+	backupRegisterCmd.Flags().StringVar(&backupPath, "path", "./backups", "Path where backups for this location are stored (local locations only)")
+	backupRegisterCmd.Flags().StringVar(&locationProviderFlag, "provider", "", "Registered provider name (required for --type=s3 or --type=gdrive)")
+	backupRegisterCmd.Flags().StringVar(&locationPrefixFlag, "prefix", "", "S3 key prefix for this location (defaults to the database name)")
 	_ = backupRegisterCmd.MarkFlagRequired("name")
 
 	// Backup restore flags
@@ -183,21 +192,83 @@ func init() {
 
 func runBackup(cmd *cobra.Command, args []string) error {
 	dbName := args[0]
-	return backup.PerformBackup(dbName, backupPath)
+	if locationName == "" {
+		return backup.PerformBackup(dbName, backupPath)
+	}
+
+	locMgr, err := location.GetConfigManager()
+	if err != nil {
+		return fmt.Errorf("failed to get location manager: %w", err)
+	}
+	loc, err := locMgr.Get(dbName, locationName)
+	if err != nil {
+		return err
+	}
+	if loc.Type == location.TypeLocal {
+		return backup.PerformBackup(dbName, loc.Path)
+	}
+
+	stagingPath := filepath.Join(os.TempDir(), "acrynite-cli", "backups")
+	if err := backup.PerformBackup(dbName, stagingPath); err != nil {
+		return err
+	}
+	staged := &location.Config{Name: loc.Name + "-staging", Database: dbName, Type: location.TypeLocal, Path: stagingPath}
+	ref, err := staged.FindLatestBackup(dbName)
+	if err != nil {
+		return fmt.Errorf("failed to find staged backup: %w", err)
+	}
+	uploaded, err := loc.UploadBackup(ref.Identifier, dbName)
+	if err != nil {
+		return err
+	}
+	_ = os.Remove(ref.Identifier)
+	_ = locMgr.TouchLastBackup(dbName, locationName, time.Now())
+	utils.Success("Backup uploaded to %s location '%s': %s", loc.Type, loc.Name, uploaded.Name)
+	return nil
+}
+
+func validateLocationProvider(locType location.Type, providerName string) error {
+	switch locType {
+	case location.TypeLocal:
+		if providerName != "" {
+			return fmt.Errorf("--provider is only valid for s3 or gdrive locations")
+		}
+		return nil
+	case location.TypeS3, location.TypeGDrive:
+		if providerName == "" {
+			return fmt.Errorf("--provider is required for --type=%s", locType)
+		}
+		providerMgr, err := provider.GetConfigManager()
+		if err != nil {
+			return fmt.Errorf("failed to get provider manager: %w", err)
+		}
+		providerCfg, err := providerMgr.Get(providerName)
+		if err != nil {
+			return err
+		}
+		if string(providerCfg.Type) != string(locType) {
+			return fmt.Errorf("provider '%s' has type '%s', not '%s'", providerName, providerCfg.Type, locType)
+		}
+		if providerCfg.Status != provider.StatusConnected {
+			return fmt.Errorf("provider '%s' is not connected (status: %s); run 'acrynite provider status' or re-authenticate", providerName, providerCfg.Status)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported location type '%s' (expected local, s3, or gdrive)", locType)
+	}
 }
 
 func runScheduleBackup(cmd *cobra.Command, args []string) error {
 	dbName := args[0]
 
-	if location.Type(locationType) != location.TypeLocal {
-		return fmt.Errorf("location type '%s' is not supported yet - only 'local' works until cloud provider SDK integration lands", locationType)
-	}
-
 	if locationName == "" {
 		locationName = fmt.Sprintf("schedule-%s", utils.Now(utils.TimestampFile))
 	}
+	locType := location.Type(locationType)
+	if err := validateLocationProvider(locType, locationProviderFlag); err != nil {
+		return err
+	}
 
-	// Get database configuration
 	manager, err := database.GetConfigManager()
 	if err != nil {
 		return fmt.Errorf("failed to get config manager: %w", err)
@@ -216,27 +287,51 @@ func runScheduleBackup(cmd *cobra.Command, args []string) error {
 	utils.Success("Connection successful!")
 	fmt.Println()
 
-	// Ensure backup directory exists
-	if err := utils.EnsureDirExists(backupPath); err != nil {
+	stagingPath := backupPath
+	if locType != location.TypeLocal {
+		stagingPath = filepath.Join(os.TempDir(), "acrynite-cli", "backups")
+	}
+	if err := utils.EnsureDirExists(stagingPath); err != nil {
 		return fmt.Errorf("failed to create backup directory: %w", err)
 	}
 
-	// Parse interval
 	interval, err := backup.ParseInterval(backupInterval)
 	if err != nil {
 		return fmt.Errorf("invalid interval: %w", err)
 	}
 
-	// Create scheduler if not exists
-	scheduler := getOrCreateScheduler()
-
-	// Create schedule ID
 	scheduleID := fmt.Sprintf("backup-%s-%s", dbName, utils.Now(utils.TimestampFile))
+	loc := &location.Config{
+		Name:       locationName,
+		Database:   dbName,
+		Type:       locType,
+		Provider:   locationProviderFlag,
+		Path:       backupPath,
+		Prefix:     locationPrefixFlag,
+		Source:     location.SourceSchedule,
+		ScheduleID: scheduleID,
+		Active:     true,
+	}
+	if locType != location.TypeLocal {
+		loc.Path = ""
+	}
+	if locType == location.TypeGDrive {
+		if err := loc.EnsureGDriveFolder(); err != nil {
+			return fmt.Errorf("failed to resolve Google Drive folder: %w", err)
+		}
+	}
 
-	// Create backup task
+	locMgr, err := location.GetConfigManager()
+	if err != nil {
+		return fmt.Errorf("failed to get location manager: %w", err)
+	}
+	if err := locMgr.Upsert(loc); err != nil {
+		return fmt.Errorf("failed to save location '%s': %w", locationName, err)
+	}
+
 	backupTask := func() error {
 		timestamp := utils.Now(utils.TimestampBackup)
-		backupFile := filepath.Join(backupPath, fmt.Sprintf("%s_%s.sql", dbName, timestamp))
+		backupFile := filepath.Join(stagingPath, fmt.Sprintf("%s_%s.sql", dbName, timestamp))
 
 		utils.Info("[Scheduled] Starting backup of '%s'...", dbName)
 
@@ -252,12 +347,26 @@ func runScheduleBackup(cmd *cobra.Command, args []string) error {
 			return err
 		}
 
+		ref, err := loc.UploadBackup(backupFile, dbName)
+		if err != nil {
+			utils.Error("[Scheduled] Upload failed: %v", err)
+			return err
+		}
+		if locType != location.TypeLocal {
+			_ = os.Remove(backupFile)
+		}
+		_ = locMgr.TouchLastBackup(dbName, locationName, time.Now())
+
 		fileSize, _ := utils.GetFileSize(backupFile)
-		utils.Success("[Scheduled] Backup completed: %s (%.2f MB)", backupFile, float64(fileSize)/(1024*1024))
+		if locType == location.TypeLocal {
+			utils.Success("[Scheduled] Backup completed: %s (%.2f MB)", ref.Identifier, float64(fileSize)/(1024*1024))
+		} else {
+			utils.Success("[Scheduled] Backup uploaded to %s location '%s': %s", locType, locationName, ref.Name)
+		}
 		return nil
 	}
 
-	// Schedule the task
+	scheduler := getOrCreateScheduler()
 	task := utils.NewTask(scheduleID, fmt.Sprintf("Backup %s", dbName), backupTask)
 	task.Description = fmt.Sprintf("Automated backup for database '%s' every %s", dbName, backupInterval)
 	task.SetSchedule(interval, true)
@@ -266,14 +375,11 @@ func runScheduleBackup(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to schedule backup: %w", err)
 	}
 
-	// Save schedule to persistence
 	scheduleManager := getOrCreateScheduleManager()
-	if err := scheduleManager.AddSchedule(scheduleID, dbName, interval, backupPath); err != nil {
+	if err := scheduleManager.AddSchedule(scheduleID, dbName, interval, stagingPath); err != nil {
 		utils.Warning("Failed to persist schedule: %v", err)
-		// Don't fail the entire operation if persistence fails, but warn the user
 	}
 
-	// Start daemon if not already running
 	if !scheduleManager.IsDaemonRunning() {
 		utils.Info("Starting backup scheduler daemon...")
 		if err := scheduleManager.StartDaemon(); err != nil {
@@ -285,33 +391,19 @@ func runScheduleBackup(cmd *cobra.Command, args []string) error {
 		utils.Info("Scheduler daemon is already running")
 	}
 
-	// Start scheduler if not running (for in-memory scheduling if needed)
 	scheduler.Start()
-
-	// Auto-create/update the durable location entry this schedule writes to.
-	locMgr, err := location.GetConfigManager()
-	if err != nil {
-		utils.Warning("Failed to get location manager: %v", err)
-	} else {
-		loc := &location.Config{
-			Name:       locationName,
-			Database:   dbName,
-			Type:       location.TypeLocal,
-			Path:       backupPath,
-			Source:     location.SourceSchedule,
-			ScheduleID: scheduleID,
-			Active:     true,
-		}
-		if err := locMgr.Upsert(loc); err != nil {
-			utils.Warning("Failed to save location '%s': %v", locationName, err)
-		}
-	}
 
 	utils.Success("Backup scheduled successfully!")
 	utils.Info("Database: %s", dbName)
 	utils.Info("Location: %s", locationName)
+	utils.Info("Type: %s", locType)
+	if locationProviderFlag != "" {
+		utils.Info("Provider: %s", locationProviderFlag)
+	}
 	utils.Info("Interval: %s (%s)", backupInterval, interval)
-	utils.Info("Output path: %s", backupPath)
+	if locType == location.TypeLocal {
+		utils.Info("Output path: %s", backupPath)
+	}
 	utils.Info("Schedule ID: %s", scheduleID)
 	utils.Info("Next backup: %s", utils.FormatTimestamp(task.NextRun, utils.TimestampLog))
 
@@ -356,9 +448,10 @@ func runUnscheduleBackup(cmd *cobra.Command, args []string) error {
 
 func runRegisterBackup(cmd *cobra.Command, args []string) error {
 	dbName := args[0]
+	locType := location.Type(locationType)
 
-	if location.Type(locationType) != location.TypeLocal {
-		return fmt.Errorf("location type '%s' is not supported yet - only 'local' works until cloud provider SDK integration lands", locationType)
+	if err := validateLocationProvider(locType, locationProviderFlag); err != nil {
+		return err
 	}
 
 	locMgr, err := location.GetConfigManager()
@@ -369,17 +462,31 @@ func runRegisterBackup(cmd *cobra.Command, args []string) error {
 	loc := &location.Config{
 		Name:     locationName,
 		Database: dbName,
-		Type:     location.TypeLocal,
+		Type:     locType,
+		Provider: locationProviderFlag,
 		Path:     backupPath,
+		Prefix:   locationPrefixFlag,
 		Source:   location.SourceManual,
 		Active:   true,
+	}
+	if locType != location.TypeLocal {
+		loc.Path = ""
+	}
+	if locType == location.TypeGDrive {
+		if err := loc.EnsureGDriveFolder(); err != nil {
+			return fmt.Errorf("failed to resolve Google Drive folder: %w", err)
+		}
 	}
 
 	if err := locMgr.Register(loc); err != nil {
 		return err
 	}
 
-	utils.Success("Location '%s' registered for database '%s' (path: %s)", locationName, dbName, backupPath)
+	if locType == location.TypeLocal {
+		utils.Success("Location '%s' registered for database '%s' (path: %s)", locationName, dbName, backupPath)
+	} else {
+		utils.Success("%s location '%s' registered for database '%s' using provider '%s'", locType, locationName, dbName, locationProviderFlag)
+	}
 	return nil
 }
 
@@ -458,7 +565,7 @@ func runListLocations(dbName string) error {
 		latest, err := loc.FindLatestBackup(dbName)
 		latestDisplay := "none"
 		if err == nil {
-			latestDisplay = latest
+			latestDisplay = latest.Name
 		}
 
 		fmt.Printf("  Name:        %s\n", loc.Name)
@@ -518,6 +625,8 @@ var globalScheduler *utils.Scheduler
 // Global schedule manager
 var globalScheduleManager *schedule.Manager
 
+var restoreTempPath string
+
 // getOrCreateScheduler returns the global scheduler instance
 func getOrCreateScheduler() *utils.Scheduler {
 	if globalScheduler == nil {
@@ -544,6 +653,28 @@ func runRestoreBackup(cmd *cobra.Command, args []string) error {
 			return err
 		}
 		restoreFile = resolved
+	} else if restoreSchedule != "" {
+		if restoreSchedule == "any" {
+			return fmt.Errorf("--file cannot be combined with --schedule=any; name one location instead")
+		}
+		locMgr, err := location.GetConfigManager()
+		if err != nil {
+			return fmt.Errorf("failed to get location manager: %w", err)
+		}
+		loc, err := locMgr.Get(dbName, restoreSchedule)
+		if err != nil {
+			return err
+		}
+		restoreFile, err = materializeRestoreBackup(loc, location.BackupRef{
+			Name:       filepath.Base(restoreFile),
+			Identifier: restoreFile,
+		})
+		if err != nil {
+			return err
+		}
+	}
+	if restoreTempPath != "" {
+		defer os.Remove(restoreTempPath)
 	}
 
 	// Prompt for confirmation unless --force or --dry-run is set
@@ -604,12 +735,20 @@ func resolveRestoreFile(dbName string) (string, error) {
 		if selected == nil {
 			return "", fmt.Errorf("location '%s' not found for database '%s' (use 'acrynite backup list %s' to see available locations)", restoreSchedule, dbName, dbName)
 		}
-		return selected.FindLatestBackup(dbName)
+		ref, err := selected.FindLatestBackup(dbName)
+		if err != nil {
+			return "", err
+		}
+		return materializeRestoreBackup(selected, ref)
 	}
 
 	// No location specified: auto-pick if unambiguous, otherwise ask - never guess.
 	if len(candidates) == 1 {
-		return candidates[0].FindLatestBackup(dbName)
+		ref, err := candidates[0].FindLatestBackup(dbName)
+		if err != nil {
+			return "", err
+		}
+		return materializeRestoreBackup(candidates[0], ref)
 	}
 
 	names := make([]string, len(candidates))
@@ -628,7 +767,11 @@ func resolveRestoreFile(dbName string) (string, error) {
 
 	for _, loc := range candidates {
 		if loc.Name == chosen {
-			return loc.FindLatestBackup(dbName)
+			ref, err := loc.FindLatestBackup(dbName)
+			if err != nil {
+				return "", err
+			}
+			return materializeRestoreBackup(loc, ref)
 		}
 	}
 	return "", fmt.Errorf("location '%s' not found", chosen)
@@ -660,26 +803,53 @@ func filterLocationsBySource(locations []*location.Config, sourceFilter string) 
 }
 
 func latestAcrossLocations(candidates []*location.Config, dbName string) (string, error) {
-	var newestFile string
+	var newestRef location.BackupRef
+	var newestLocation *location.Config
 	var lastErr error
 	for _, loc := range candidates {
-		file, err := loc.FindLatestBackup(dbName)
+		ref, err := loc.FindLatestBackup(dbName)
 		if err != nil {
 			lastErr = err
 			utils.Warning("Skipping location '%s': %v", loc.Name, err)
 			continue
 		}
-		if newestFile == "" || file > newestFile {
-			newestFile = file
+		if newestLocation == nil || ref.Name > newestRef.Name {
+			newestRef = ref
+			newestLocation = loc
 		}
 	}
-	if newestFile == "" {
+	if newestLocation == nil {
 		if lastErr != nil {
 			return "", fmt.Errorf("no restorable backups found across any location: %w", lastErr)
 		}
 		return "", fmt.Errorf("no restorable backups found across any location")
 	}
-	return newestFile, nil
+	return materializeRestoreBackup(newestLocation, newestRef)
+}
+
+func materializeRestoreBackup(loc *location.Config, ref location.BackupRef) (string, error) {
+	if loc.Type == location.TypeLocal {
+		return ref.Identifier, nil
+	}
+
+	file, err := os.CreateTemp("", "acrynite-restore-*.sql")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temporary restore file: %w", err)
+	}
+	destPath := file.Name()
+	if err := file.Close(); err != nil {
+		_ = os.Remove(destPath)
+		return "", fmt.Errorf("failed to prepare temporary restore file: %w", err)
+	}
+
+	utils.Info("Downloading '%s' from %s location '%s'...", ref.Name, loc.Type, loc.Name)
+	localPath, err := loc.DownloadBackup(ref, destPath)
+	if err != nil {
+		_ = os.Remove(destPath)
+		return "", err
+	}
+	restoreTempPath = destPath
+	return localPath, nil
 }
 
 func runVerifyBackup(cmd *cobra.Command, args []string) error {

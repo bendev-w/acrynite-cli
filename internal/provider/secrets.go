@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 
@@ -50,6 +51,9 @@ func NewSecretStore() (*SecretStore, error) {
 		if err := utils.WriteFile(s.keyPath, []byte(base64.StdEncoding.EncodeToString(key))); err != nil {
 			return nil, fmt.Errorf("failed to write secret key: %w", err)
 		}
+		if err := os.Chmod(s.keyPath, 0600); err != nil {
+			return nil, fmt.Errorf("failed to restrict secret key permissions: %w", err)
+		}
 	}
 
 	return s, nil
@@ -83,7 +87,10 @@ func (s *SecretStore) saveAll(secrets map[string]string) error {
 	if err != nil {
 		return err
 	}
-	return utils.WriteFile(s.secretPath, data)
+	if err := utils.WriteFile(s.secretPath, data); err != nil {
+		return err
+	}
+	return os.Chmod(s.secretPath, 0600)
 }
 
 func (s *SecretStore) newCipher() (cipher.AEAD, error) {

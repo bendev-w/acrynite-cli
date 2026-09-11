@@ -12,6 +12,9 @@ A powerful command-line tool for managing database backups with ease. Acrynite C
 - ⏰ **Automated Scheduling** - Schedule backups at regular intervals (hourly, daily, weekly, or custom)
 - 🗄️ **Multi-Database Support** - Support for PostgreSQL and MySQL
 - 🔧 **Easy Database Management** - Register, list, and manage database connections
+- 📍 **Durable Backup Locations** - Every schedule/manual backup writes to a named location that survives the schedule being deleted or recreated
+- ☁️ **Cloud Storage** - Upload, discover, and restore backups from Google Drive, Amazon S3, and S3-compatible services
+- ♻️ **Smart Restore** - Restore by database name; the CLI figures out which location/file to use (or asks when it's ambiguous), never guesses
 - 💾 **Local Configuration** - Store database configurations securely on your system
 - 📊 **Version Tracking** - Version management for your CLI
 
@@ -81,11 +84,21 @@ acrynite backup run production-db --path ./backups
 
 ### 4. Schedule Automated Backups
 
-Set up recurring backups:
+Set up recurring backups. This also registers a named **location** for the database, which is what `backup restore` uses later:
 
 ```bash
-acrynite backup schedule production-db --interval daily --path ./backups
+acrynite backup schedule production-db --interval daily --path ./backups --name nightly
 ```
+
+### 5. Restore a Backup
+
+Restore the newest backup without having to remember a file path:
+
+```bash
+acrynite backup restore production-db
+```
+
+If the database has more than one location, you'll be prompted to pick one - the CLI never guesses which backup to restore.
 
 ## Usage
 
@@ -148,6 +161,7 @@ acrynite backup run [database-name] [flags]
 
 Flags:
   --path string        Path to store backup files (required)
+  --location string    Upload to this registered location instead of keeping the backup locally
 
 Example:
   acrynite backup run production-db --path ./backups
@@ -160,28 +174,113 @@ acrynite backup schedule [database-name] [flags]
 
 Flags:
   --interval string    Backup frequency: hourly, daily, weekly, or custom duration (e.g., 30m, 2h, 24h) (default: daily)
-  --path string        Path to store backup files (default: ./backups)
+  --path string        Path to store backup files (local locations only; default: ./backups)
+  --name string        Label for the location this schedule writes to (default: auto-generated)
+  --type string        Location type: local, s3, or gdrive (default: local)
+  --provider string    Registered provider name (required for s3/gdrive)
+  --prefix string      S3 key prefix (optional)
 
 Example:
-  acrynite backup schedule production-db --interval daily --path ./backups
-  acrynite backup schedule dev-db --interval 6h --path /var/backups
-  acrynite backup schedule test-db --interval weekly --path ./backups
+  acrynite backup schedule production-db --interval daily --path ./backups --name nightly
+  acrynite backup schedule dev-db --interval 6h --type=s3 --provider=work-bucket --name dev-6h
+  acrynite backup schedule test-db --interval weekly --type=gdrive --provider=personal-drive --name weekly
 ```
 
-✅ **Note:** When you schedule a backup, the scheduler daemon automatically starts in the background and executes backups according to the interval.
+✅ **Note:** When you schedule a backup, the scheduler daemon automatically starts in the background and executes backups according to the interval. It also creates (or updates) a **location** entry for the database/name pair, which `backup restore` uses to find backups later.
 
-**List Scheduled Backups:**
+**Stop a Schedule, Keep the Location Restorable:**
 ```bash
-acrynite backup list
+acrynite backup unschedule [database-name] --name [location-name]
+
+Example:
+  acrynite backup unschedule production-db --name nightly
+```
+This cancels the recurring job but keeps the location (and its existing backups) around so you can still restore from it later.
+
+**Manually Register a Location (no schedule):**
+```bash
+acrynite backup register [database-name] --name [location-name] --path [dir] [flags]
+
+Flags:
+  --name string        Label for this location (required)
+  --type string        Location type: local, s3, or gdrive (default: local)
+  --path string        Path where backups are stored (local locations only; default: ./backups)
+  --provider string    Registered provider name (required for s3/gdrive)
+  --prefix string      S3 key prefix (optional)
+
+Example:
+  acrynite backup register production-db --name imported --path ./old-backups
+```
+Useful for inherited backups or one-off imports where you don't want a recurring job.
+
+**List Scheduled Backups, or Locations for a Database:**
+```bash
+acrynite backup list               # all active schedules
+acrynite backup list [database-name]  # locations + latest backup for that database
 ```
 
-**Cancel a Scheduled Backup:**
+**Cancel a Scheduled Backup (by schedule ID):**
 ```bash
 acrynite backup cancel [schedule-id]
 
 Example:
   acrynite backup cancel backup-production-db-20260614_094714
 ```
+
+**Restore a Database:**
+```bash
+acrynite backup restore [database-name] [flags]
+
+Flags:
+  -f, --file string       Restore this exact backup file, bypassing location discovery entirely
+      --schedule string   Restore from this named location only, or 'any' to combine all locations (alias: --location)
+      --location string   Alias for --schedule
+      --source string     Filter candidate locations by origin: auto|manual|all (default: all)
+      --dry-run           Test restore pre-conditions without applying changes
+      --force              Skip the confirmation prompt
+      --custom-path string Custom path to the psql or mysql client executable
+
+Example:
+  acrynite backup restore production-db                       # newest backup; asks if ambiguous
+  acrynite backup restore production-db --schedule nightly    # newest backup from that location only
+  acrynite backup restore production-db --schedule any        # newest backup across all locations
+  acrynite backup restore production-db --file ./backups/production-db_20260907-235743.sql
+```
+Every restore first tests the target connection and validates the backup file before touching the database. When no `--file`/`--schedule` is given and more than one location exists for the database, you're prompted to choose - restore never silently guesses.
+
+**Verify a Backup File:**
+```bash
+acrynite backup verify [file-path] [flags]
+
+Flags:
+  -f, --file string    Path to SQL backup file
+  --type string        Expected database type (postgres or mysql)
+
+Example:
+  acrynite backup verify ./backups/production-db_20260907.sql
+  acrynite backup validate ./backups/test.sql --type mysql
+```
+
+#### Cloud Providers (`provider`)
+
+Register cloud storage accounts once, then reference them by name from any S3 or Google Drive location.
+
+**Add a Provider:**
+```bash
+acrynite provider add gdrive --name personal-drive
+acrynite provider add s3 --name work-bucket
+```
+- `gdrive` opens the system browser, requests the narrow `drive.file` scope, receives the callback on a temporary local port, and saves the refresh token. Before running it, create a Google Cloud "Desktop app" OAuth client with the Drive API enabled and set `ACRYNITE_GDRIVE_CLIENT_ID` and `ACRYNITE_GDRIVE_CLIENT_SECRET`.
+- `s3` prompts interactively for access key, secret key, region, bucket, and an optional S3-compatible endpoint. It runs `HeadBucket` before saving anything. Command-line flags are accepted but warned about because secrets can land in shell history.
+
+**List / Check / Remove:**
+```bash
+acrynite provider list
+acrynite provider status              # actively checks Drive authorization / S3 bucket access
+acrynite provider reauth [name]       # re-runs the Google OAuth flow
+acrynite provider remove [name] [--force]
+```
+`provider remove` is blocked if an active location still references the provider, unless `--force` is passed.
 
 #### Version
 
@@ -214,6 +313,13 @@ Scheduled backups are stored in:
 - **Linux/macOS:** `~/.acrynite-cli/storage/schedules/schedules.json`
 - **Windows:** `%APPDATA%\acrynite-cli\storage\schedules\schedules.json`
 
+### Locations & Providers
+Backup locations (the durable per-database handle used by `backup restore`) and registered cloud providers are stored in:
+- `./storage/configs/locations.json`
+- `./storage/configs/providers.json`
+
+Provider secrets (S3 access/secret keys) are encrypted at rest and kept separately under `~/.acrynite-cli/secrets.enc.json`, with the encryption key in `~/.acrynite-cli/.secret.key`. This is a local fallback until OS keychain integration is added - it is not a substitute for a real keychain.
+
 ### Backup Files
 Backup files are stored in the path you specify during scheduling:
 ```bash
@@ -229,25 +335,36 @@ Backup files are stored in the path you specify during scheduling:
 ```
 acrynite-cli/
 ├── cmd/                    # CLI command definitions
-│   ├── backup.go          # Backup command logic
+│   ├── backup.go          # Backup, schedule, location & restore command logic
+│   ├── provider.go        # Cloud provider registration commands
 │   ├── command.go         # Root command setup
-│   ├── db.go              # Database management commands
+│   ├── db.go               # Database management commands
 │   └── version.go         # Version command
 ├── internal/              # Internal packages
-│   ├── backup/            # Backup implementation
+│   ├── backup/             # Backup implementation
 │   │   └── full.go        # Full backup operations
-│   ├── schedule/          # Schedule management
+│   ├── restore/            # Restore & backup file validation
+│   │   ├── restore.go      # Restore execution (psql/mysql)
+│   │   └── validate.go    # Backup file inspection & validation
+│   ├── location/           # Durable per-database backup locations
+│   │   ├── types.go        # Location config & storage types
+│   │   ├── manager.go     # Location CRUD (locations.json)
+│   │   └── discover.go    # Finding the latest backup file in a location
+│   ├── provider/            # Cloud storage provider credentials
+│   │   ├── types.go        # Provider config & storage types
+│   │   ├── manager.go     # Provider CRUD (providers.json)
+│   │   └── secrets.go     # Local encrypted secret store (AES-GCM)
+│   ├── schedule/           # Schedule management
 │   │   ├── persistence.go # Schedule persistence layer
 │   │   └── manager.go     # Schedule manager & daemon
-│   ├── config/            # Configuration management
-│   ├── database/          # Database connectivity
-│   │   ├── connect.go     # Connection handling
-│   │   ├── register.go    # Registration logic
-│   │   └── types.go       # Data types
-│   └── cron/              # (Legacy scheduling)
+│   ├── config/              # Generic configuration manager
+│   └── database/            # Database connectivity
+│       ├── connect.go     # Connection handling
+│       ├── register.go     # Registration logic
+│       └── types.go       # Data types
 ├── storage/               # Local storage
 │   ├── backups/           # Backup files
-│   ├── configs/           # Configuration files (databases.json)
+│   ├── configs/           # Configuration files (databases.json, locations.json, providers.json)
 │   ├── logs/              # Application logs
 │   └── schedules/         # Schedule metadata & PID tracking
 ├── utils/                 # Utility functions
@@ -282,6 +399,8 @@ go build -o acrynite
 - `github.com/AlecAivazis/survey` - Interactive prompts
 - `github.com/lib/pq` - PostgreSQL driver
 - `github.com/go-sql-driver/mysql` - MySQL driver
+- `github.com/aws/aws-sdk-go-v2` - Amazon S3 and S3-compatible storage
+- `golang.org/x/oauth2` / `google.golang.org/api` - Google OAuth and Drive API
 
 ## Scheduler Daemon
 
@@ -344,6 +463,45 @@ acrynite db import --file configs.json
 
 # Re-schedule if needed on the new machine
 acrynite backup schedule prod-db --interval daily --path /backups
+```
+
+### Restore From the Right Location
+```bash
+# One schedule ("nightly") plus one manual import ("imported") for the same db
+acrynite backup schedule production-db --interval daily --path /backups/nightly --name nightly
+acrynite backup register production-db --name imported --path /backups/legacy
+
+# See what's available
+acrynite backup list production-db
+
+# Ambiguous - two locations exist, so you'll be prompted to pick one
+acrynite backup restore production-db
+
+# Be explicit instead
+acrynite backup restore production-db --schedule nightly
+acrynite backup restore production-db --schedule any --source auto
+
+# Stop the recurring job but keep the location (and its backups) restorable
+acrynite backup unschedule production-db --name nightly
+```
+
+### Back Up to S3 or Google Drive
+```bash
+# Authenticate/register providers once
+acrynite provider add s3 --name work-bucket
+acrynite provider add gdrive --name personal-drive
+
+# Schedule cloud backups
+acrynite backup schedule production-db --name nightly-s3 --interval daily \
+  --type s3 --provider work-bucket --prefix databases/production
+acrynite backup schedule production-db --name weekly-drive --interval weekly \
+  --type gdrive --provider personal-drive
+
+# Upload one backup immediately to an existing cloud location
+acrynite backup run production-db --location nightly-s3
+
+# Restore by location; cloud files are downloaded to a temporary SQL file
+acrynite backup restore production-db --location nightly-s3
 ```
 
 ## Troubleshooting

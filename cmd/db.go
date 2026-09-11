@@ -21,6 +21,7 @@ var (
 	dbPassword string
 	dbDatabase string
 	dbSSLMode  string
+	dbDumpPath string
 	forceFlag  bool
 	exportFile string
 	importFile string
@@ -139,6 +140,7 @@ func init() {
 	dbRegisterCmd.Flags().StringVar(&dbPassword, "password", "", "Database password (required)")
 	dbRegisterCmd.Flags().StringVar(&dbDatabase, "database", "", "Database name (required)")
 	dbRegisterCmd.Flags().StringVar(&dbSSLMode, "ssl-mode", "disable", "SSL mode for PostgreSQL (disable, require, verify-ca, verify-full)")
+	dbRegisterCmd.Flags().StringVar(&dbDumpPath, "dump-path", "", "Custom path to pg_dump or mysqldump executable")
 
 	// Update command flags
 	dbUpdateCmd.Flags().StringVar(&dbName, "name", "", "New database identifier")
@@ -148,6 +150,7 @@ func init() {
 	dbUpdateCmd.Flags().StringVar(&dbPassword, "password", "", "New database password")
 	dbUpdateCmd.Flags().StringVar(&dbDatabase, "database", "", "New database name")
 	dbUpdateCmd.Flags().StringVar(&dbSSLMode, "ssl-mode", "", "New SSL mode (disable, require, verify-ca, verify-full)")
+	dbUpdateCmd.Flags().StringVar(&dbDumpPath, "dump-path", "", "New custom dump executable path")
 
 	// Remove command flags
 	dbRemoveCmd.Flags().BoolVarP(&forceFlag, "force", "f", false, "Skip confirmation prompt")
@@ -159,14 +162,43 @@ func runDBRegister(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to get config manager: %w", err)
 	}
 
-	// If flags are not provided, prompt interactively
-	if dbName == "" || dbHost == "" || dbUser == "" || dbPassword == "" || dbDatabase == "" {
-		utils.Info("Interactive database registration")
+	// Check which required fields are missing
+	missingFields := []string{}
+	if dbName == "" {
+		missingFields = append(missingFields, "name")
+	}
+	if dbHost == "" {
+		missingFields = append(missingFields, "host")
+	}
+	if dbUser == "" {
+		missingFields = append(missingFields, "user")
+	}
+	if dbDatabase == "" {
+		missingFields = append(missingFields, "database")
+	}
+
+	// Check if any required fields are missing
+	if len(missingFields) > 0 {
+		utils.Info("Database registration")
 		fmt.Println()
 
-		if err := promptDatabaseDetails(); err != nil {
+		// For missing fields, use interactive mode
+		if err := promptDatabaseDetailsForMissing(missingFields); err != nil {
 			return err
 		}
+	}
+
+	// If no password was provided via flag and no database has all required fields yet, ask for password
+	if !cmd.Flags().Changed("password") && len(missingFields) == 0 {
+		utils.Info("Database password (optional - leave blank if no password):")
+		var pwd string
+		prompt := &survey.Password{
+			Message: "Database password:",
+		}
+		if err := survey.AskOne(prompt, &pwd); err != nil {
+			return err
+		}
+		dbPassword = pwd
 	}
 
 	// Set default port based on database type if not specified
@@ -191,15 +223,14 @@ func runDBRegister(cmd *cobra.Command, args []string) error {
 	if dbUser == "" {
 		return fmt.Errorf("user is required")
 	}
-	if dbPassword == "" {
-		return fmt.Errorf("password is required")
-	}
+	// Password is optional - some databases don't require it (e.g., XAMPP MySQL)
 	if dbDatabase == "" {
 		return fmt.Errorf("database name is required")
 	}
 
 	// Create configuration
 	config := database.NewDBConfig(dbName, dbType, dbHost, dbPort, dbUser, dbPassword, dbDatabase, dbSSLMode)
+	config.DumpPath = dbDumpPath
 
 	// Register the database
 	utils.Info("Registering database: %s", dbName)
@@ -387,6 +418,100 @@ func promptDatabaseDetails() error {
 	return nil
 }
 
+// promptDatabaseDetailsForMissing prompts only for missing required fields
+func promptDatabaseDetailsForMissing(missingFields []string) error {
+	questions := []*survey.Question{}
+
+	// Add questions only for missing fields
+	if contains(missingFields, "name") {
+		questions = append(questions, &survey.Question{
+			Name: "name",
+			Prompt: &survey.Input{
+				Message: "Database identifier (unique name):",
+				Help:    "A unique name to identify this database (e.g., production-db)",
+			},
+			Validate: survey.Required,
+		})
+	}
+
+	// Always allow type override if it's provided or missing
+	if dbType == "" {
+		dbType = "postgres"
+	}
+
+	if contains(missingFields, "host") {
+		questions = append(questions, &survey.Question{
+			Name: "host",
+			Prompt: &survey.Input{
+				Message: "Database host:",
+				Default: "localhost",
+			},
+			Validate: survey.Required,
+		})
+	}
+
+	if contains(missingFields, "user") {
+		questions = append(questions, &survey.Question{
+			Name: "user",
+			Prompt: &survey.Input{
+				Message: "Database user:",
+				Default: "postgres",
+			},
+			Validate: survey.Required,
+		})
+	}
+
+	if contains(missingFields, "database") {
+		questions = append(questions, &survey.Question{
+			Name: "database",
+			Prompt: &survey.Input{
+				Message: "Database name:",
+			},
+			Validate: survey.Required,
+		})
+	}
+
+	if len(questions) == 0 {
+		return nil
+	}
+
+	answers := struct {
+		Name     string
+		Host     string
+		User     string
+		Database string
+	}{}
+
+	if err := survey.Ask(questions, &answers); err != nil {
+		return err
+	}
+
+	if contains(missingFields, "name") && answers.Name != "" {
+		dbName = answers.Name
+	}
+	if contains(missingFields, "host") && answers.Host != "" {
+		dbHost = answers.Host
+	}
+	if contains(missingFields, "user") && answers.User != "" {
+		dbUser = answers.User
+	}
+	if contains(missingFields, "database") && answers.Database != "" {
+		dbDatabase = answers.Database
+	}
+
+	return nil
+}
+
+// contains checks if a slice contains a string
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
 func displayDatabaseInfo(config *database.DBConfig) {
 	fmt.Println("Database Configuration:")
 	fmt.Println(strings.Repeat("=", 50))
@@ -398,6 +523,9 @@ func displayDatabaseInfo(config *database.DBConfig) {
 	fmt.Printf("  User:           %s\n", config.User)
 	if config.Type == "postgres" {
 		fmt.Printf("  SSL Mode:       %s\n", config.SSLMode)
+	}
+	if config.DumpPath != "" {
+		fmt.Printf("  Dump Path:      %s\n", config.DumpPath)
 	}
 	fmt.Printf("  Status:         %s\n", func() string {
 		if config.IsActive {

@@ -8,13 +8,13 @@ import (
 // DBConfig represents a database configuration
 type DBConfig struct {
 	Name       string    `json:"name"`
-	Type       string    `json:"type"`        // postgres or mysql
+	Type       string    `json:"type"` // postgres or mysql
 	Host       string    `json:"host"`
 	Port       int       `json:"port"`
 	User       string    `json:"user"`
 	Password   string    `json:"password"`
 	Database   string    `json:"database"`
-	SSLMode    string    `json:"ssl_mode"`    // For PostgreSQL only
+	SSLMode    string    `json:"ssl_mode"` // For PostgreSQL only
 	DumpPath   string    `json:"dump_path,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`

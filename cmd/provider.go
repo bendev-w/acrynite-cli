@@ -97,19 +97,21 @@ func runProviderAdd(cmd *cobra.Command, args []string) error {
 
 	switch provider.Type(args[0]) {
 	case provider.TypeGDrive:
-		utils.Warning("Google OAuth is not implemented in this build yet.")
-		utils.Warning("Registering '%s' as a placeholder - it cannot be used by schedules until OAuth support lands.", providerName)
-
-		cfg := &provider.Config{
-			Name:   providerName,
-			Type:   provider.TypeGDrive,
-			Status: provider.StatusNotConfigured,
-			Note:   "OAuth flow not implemented yet; run 'acrynite provider reauth' once available",
+		secretStore, err := provider.NewSecretStore()
+		if err != nil {
+			return fmt.Errorf("failed to initialize secret store: %w", err)
 		}
+
+		cfg, err := provider.AddGDrive(providerName, secretStore)
+		if err != nil {
+			return fmt.Errorf("google authorization failed: %w", err)
+		}
+
 		if err := providerMgr.Register(cfg); err != nil {
+			_ = secretStore.Delete(providerName + ":gdrive_token")
 			return err
 		}
-		utils.Success("Provider '%s' registered (not_configured)", providerName)
+		utils.Success("Provider '%s' connected as %s", providerName, cfg.Account)
 		return nil
 
 	case provider.TypeS3:
@@ -145,10 +147,7 @@ func runProviderAdd(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		// NOTE: a lightweight connectivity check (e.g. HeadBucket) should run here
-		// before saving anything, once the AWS SDK is added as a dependency.
-		utils.Warning("Skipping live bucket connectivity check - AWS SDK integration not added yet")
-
+		// Lightweight connectivity check before saving anything.
 		secretStore, err := provider.NewSecretStore()
 		if err != nil {
 			return fmt.Errorf("failed to initialize secret store: %w", err)
@@ -160,19 +159,30 @@ func runProviderAdd(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to store secret key: %w", err)
 		}
 
+		status := provider.StatusConnected
+		note := ""
+		checkCfg := &provider.Config{Name: providerName, Type: provider.TypeS3, Region: providerRegion, Bucket: providerBucket, Endpoint: providerEndpoint}
+		if err := provider.VerifyS3Bucket(checkCfg, secretStore); err != nil {
+			_ = secretStore.Delete(providerName + ":access_key")
+			_ = secretStore.Delete(providerName + ":secret_key")
+			return fmt.Errorf("connectivity check failed, provider not saved: %w", err)
+		}
+
 		cfg := &provider.Config{
 			Name:     providerName,
 			Type:     provider.TypeS3,
 			Region:   providerRegion,
 			Bucket:   providerBucket,
 			Endpoint: providerEndpoint,
-			Status:   provider.StatusUnverified,
-			Note:     "Connectivity not verified; AWS SDK integration not added yet",
+			Status:   status,
+			Note:     note,
 		}
 		if err := providerMgr.Register(cfg); err != nil {
+			_ = secretStore.Delete(providerName + ":access_key")
+			_ = secretStore.Delete(providerName + ":secret_key")
 			return err
 		}
-		utils.Success("Provider '%s' registered (unverified)", providerName)
+		utils.Success("Provider '%s' registered and verified (bucket '%s' is reachable)", providerName, providerBucket)
 		return nil
 
 	default:
@@ -225,9 +235,36 @@ func runProviderStatus(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	secretStore, err := provider.NewSecretStore()
+	if err != nil {
+		return fmt.Errorf("failed to initialize secret store: %w", err)
+	}
+
 	for _, p := range providers {
-		// Real credential checks require the gdrive/s3 SDKs, which are not wired up yet.
-		utils.Warning("%s (%s): live credential check not implemented yet - stored status is '%s'", p.Name, p.Type, p.Status)
+		switch p.Type {
+		case provider.TypeS3:
+			if err := provider.VerifyS3Bucket(p, secretStore); err != nil {
+				utils.Error("%s (s3): FAILED - %v", p.Name, err)
+				_ = providerMgr.UpdateStatus(p.Name, provider.StatusError, err.Error())
+			} else {
+				utils.Success("%s (s3): OK - bucket '%s' reachable", p.Name, p.Bucket)
+				_ = providerMgr.UpdateStatus(p.Name, provider.StatusConnected, "")
+			}
+		case provider.TypeGDrive:
+			driveSvc, err := provider.NewDriveService(p, secretStore)
+			if err == nil {
+				_, err = driveSvc.About.Get().Fields("user").Do()
+			}
+			if err != nil {
+				utils.Error("%s (gdrive): FAILED - %v (try 'acrynite provider reauth %s')", p.Name, err, p.Name)
+				_ = providerMgr.UpdateStatus(p.Name, provider.StatusError, err.Error())
+			} else {
+				utils.Success("%s (gdrive): OK - authorized as %s", p.Name, p.Account)
+				_ = providerMgr.UpdateStatus(p.Name, provider.StatusConnected, "")
+			}
+		default:
+			utils.Warning("%s: unknown provider type '%s'", p.Name, p.Type)
+		}
 	}
 	return nil
 }
@@ -239,11 +276,32 @@ func runProviderReauth(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to get provider manager: %w", err)
 	}
 
-	if _, err := providerMgr.Get(name); err != nil {
+	existing, err := providerMgr.Get(name)
+	if err != nil {
 		return err
 	}
 
-	return fmt.Errorf("reauth is not implemented yet - OAuth/SDK integration is required first")
+	if existing.Type != provider.TypeGDrive {
+		return fmt.Errorf("reauth is only needed for gdrive providers (s3 credentials are re-entered with 'provider add s3 --name=%s' after 'provider remove')", name)
+	}
+
+	secretStore, err := provider.NewSecretStore()
+	if err != nil {
+		return fmt.Errorf("failed to initialize secret store: %w", err)
+	}
+
+	cfg, err := provider.ReauthGDrive(name, secretStore)
+	if err != nil {
+		_ = providerMgr.UpdateStatus(name, provider.StatusError, err.Error())
+		return fmt.Errorf("google authorization failed: %w", err)
+	}
+
+	if err := providerMgr.UpdateStatus(name, cfg.Status, ""); err != nil {
+		return err
+	}
+
+	utils.Success("Provider '%s' re-authorized as %s", name, cfg.Account)
+	return nil
 }
 
 func runProviderRemove(cmd *cobra.Command, args []string) error {
@@ -276,6 +334,7 @@ func runProviderRemove(cmd *cobra.Command, args []string) error {
 	if err == nil {
 		_ = secretStore.Delete(name + ":access_key")
 		_ = secretStore.Delete(name + ":secret_key")
+		_ = secretStore.Delete(name + ":gdrive_token")
 	}
 
 	utils.Success("Provider '%s' removed", name)
