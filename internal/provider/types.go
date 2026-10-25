@@ -26,6 +26,7 @@ type Config struct {
 	Account   string    `json:"account,omitempty"`  // e.g. gdrive email
 	Region    string    `json:"region,omitempty"`   // s3
 	Bucket    string    `json:"bucket,omitempty"`   // s3
+	Prefix    string    `json:"prefix,omitempty"`   // s3
 	Endpoint  string    `json:"endpoint,omitempty"` // s3-compatible services
 	Status    string    `json:"status"`
 	Note      string    `json:"note,omitempty"`

@@ -9,16 +9,12 @@ import (
 var (
 	// rootCmd represents the base command when called without any subcommands
 	rootCmd = &cobra.Command{
-		Use:   "acrynite-cli",
-		Short: "Acrynite CLI - A powerful command-line tool",
-		Long: `Acrynite CLI is a command-line interface tool that provides
-various utilities and commands for your workflow.
-
-Use this tool to streamline your development process and automate
-common tasks with ease.`,
+		Use:   "acrynite",
+		Short: "PostgreSQL backup and recovery CLI",
+		Long:  "Acrynite registers PostgreSQL clusters and S3 destinations, then manages backups and recovery metadata.",
 		Run: func(cmd *cobra.Command, args []string) {
 			// Default behavior when no subcommand is specified
-			fmt.Println("Welcome to Acrynite CLI!")
+			fmt.Println("Acrynite PostgreSQL backup and recovery CLI")
 			fmt.Println("Use --help to see available commands.")
 		},
 	}
@@ -44,12 +40,13 @@ func registerCommands() {
 	rootCmd.AddCommand(versionCmd)
 
 	// add command to register db
-	rootCmd.AddCommand(dbCmd)
+	rootCmd.AddCommand(databaseCmd)
+	rootCmd.AddCommand(storageCmd)
 
 	// add command for backups
 	rootCmd.AddCommand(backupCmd)
+	rootCmd.AddCommand(scheduleCmd)
+	rootCmd.AddCommand(walCmd)
+	rootCmd.AddCommand(recoveryPointsCmd)
+	rootCmd.AddCommand(restoreCmd)
 }
-
-
-
-

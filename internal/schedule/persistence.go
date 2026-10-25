@@ -15,10 +15,19 @@ type ScheduleData struct {
 	Database    string        `json:"database"`
 	Interval    time.Duration `json:"interval"`
 	Path        string        `json:"path"`
-	CreatedAt   time.Time     `json:"created_at"`
-	LastRunTime time.Time     `json:"last_run_time"`
-	RunCount    int           `json:"run_count"`
-	ErrorCount  int           `json:"error_count"`
+	Method      string        `json:"method,omitempty"` // "dump" (default) or "basebackup"
+	// WALMode is how WAL is archived: "direct", "spool" or "stream" (empty = not configured).
+	WALMode string `json:"wal_mode,omitempty"`
+	// WALSlot is the replication slot used in stream mode.
+	WALSlot string `json:"wal_slot,omitempty"`
+	// WALSpoolDir is the host folder the daemon uploads WAL from (spool and stream modes).
+	WALSpoolDir string `json:"wal_spool_dir,omitempty"`
+	// WALContainerDir is the same folder as PostgreSQL sees it.
+	WALContainerDir string        `json:"wal_container_dir,omitempty"`
+	CreatedAt       time.Time     `json:"created_at"`
+	LastRunTime     time.Time     `json:"last_run_time"`
+	RunCount        int           `json:"run_count"`
+	ErrorCount      int           `json:"error_count"`
 }
 
 // SchedulePersistence handles saving and loading schedules from disk
@@ -87,7 +96,7 @@ func (sp *SchedulePersistence) SaveSchedules(schedules map[string]*ScheduleData)
 }
 
 // AddSchedule adds a new schedule
-func (sp *SchedulePersistence) AddSchedule(scheduleID, database string, interval time.Duration, backupPath string) error {
+func (sp *SchedulePersistence) AddSchedule(scheduleID, database string, interval time.Duration, backupPath, method string) error {
 	schedules, err := sp.LoadSchedules()
 	if err != nil {
 		return err
@@ -98,9 +107,27 @@ func (sp *SchedulePersistence) AddSchedule(scheduleID, database string, interval
 		Database:  database,
 		Interval:  interval,
 		Path:      backupPath,
+		Method:    method,
 		CreatedAt: time.Now(),
 	}
 
+	return sp.SaveSchedules(schedules)
+}
+
+// SetWALSpool records the WAL archiving mode and folders for a schedule
+func (sp *SchedulePersistence) SetWALSpool(scheduleID, mode, slot, hostDir, containerDir string) error {
+	schedules, err := sp.LoadSchedules()
+	if err != nil {
+		return err
+	}
+	s, exists := schedules[scheduleID]
+	if !exists {
+		return fmt.Errorf("schedule '%s' not found", scheduleID)
+	}
+	s.WALMode = mode
+	s.WALSlot = slot
+	s.WALSpoolDir = hostDir
+	s.WALContainerDir = containerDir
 	return sp.SaveSchedules(schedules)
 }
 

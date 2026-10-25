@@ -150,12 +150,28 @@ func resolveDumpExecutable(dbType string, customDumpPath string) (string, error)
 	if dbType == "mysql" {
 		commandName = "mysqldump"
 	}
+	return resolveExecutable(commandName, dbType, customDumpPath)
+}
 
+// resolveExecutable resolves a PostgreSQL or MySQL client binary by name. A custom path
+// may point at the binary itself or, for sibling tools like pg_basebackup, at a sibling
+// binary in the same directory.
+func resolveExecutable(commandName, dbType, customDumpPath string) (string, error) {
 	// 1. Custom explicit dump path from database configuration
 	if strings.TrimSpace(customDumpPath) != "" {
 		expanded := expandPathVars(customDumpPath)
 		if info, err := os.Stat(expanded); err == nil && !info.IsDir() {
-			return expanded, nil
+			if baseNameWithoutExe(expanded) == commandName {
+				return expanded, nil
+			}
+			sibling := filepath.Join(filepath.Dir(expanded), commandName+filepath.Ext(expanded))
+			if info, err := os.Stat(sibling); err == nil && !info.IsDir() {
+				return sibling, nil
+			}
+			if commandName == "pg_dump" || commandName == "mysqldump" {
+				return expanded, nil
+			}
+			return "", fmt.Errorf("%s not found next to configured dump path %s", commandName, customDumpPath)
 		}
 		return "", fmt.Errorf("configured custom dump path for %s is invalid or not found: %s", commandName, customDumpPath)
 	}
@@ -185,7 +201,9 @@ func resolveDumpExecutable(dbType string, customDumpPath string) (string, error)
 	if dbType == "mysql" {
 		patterns = getMySQLSearchPatterns()
 	} else {
-		patterns = getPostgresSearchPatterns()
+		for _, pattern := range getPostgresSearchPatterns() {
+			patterns = append(patterns, strings.ReplaceAll(pattern, "pg_dump", commandName))
+		}
 	}
 
 	var foundMatches []string
@@ -212,6 +230,11 @@ func resolveDumpExecutable(dbType string, customDumpPath string) (string, error)
 
 	envVarName := fmt.Sprintf("%s_PATH", strings.ToUpper(commandName))
 	return "", fmt.Errorf("%s executable not found in system PATH or standard %s installation locations. Please add it to your system PATH or set the %s environment variable", commandName, strings.ToUpper(runtime.GOOS), envVarName)
+}
+
+func baseNameWithoutExe(path string) string {
+	name := filepath.Base(path)
+	return strings.TrimSuffix(name, filepath.Ext(name))
 }
 
 func expandPathVars(path string) string {

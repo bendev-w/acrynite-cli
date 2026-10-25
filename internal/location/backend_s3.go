@@ -112,16 +112,27 @@ func (cfg *Config) uploadS3Backup(localPath, dbName string) (BackupRef, error) {
 
 	filename := baseName(localPath)
 	key := cfg.s3ObjectKey(filename)
+	utils.Info("[S3] Preparing upload for database '%s'", dbName)
+	utils.Info("[S3] Local file: %s", localPath)
+	utils.Info("[S3] Bucket: %s", pCfg.Bucket)
+	utils.Info("[S3] Object key: %s", key)
 
 	file, err := os.Open(localPath)
 	if err != nil {
 		return BackupRef{}, fmt.Errorf("failed to open backup file for upload: %w", err)
 	}
 	defer file.Close()
+	if info, statErr := file.Stat(); statErr == nil {
+		utils.Info("[S3] File size: %.2f MB", float64(info.Size())/(1024*1024))
+	} else {
+		utils.Warning("[S3] Could not stat file before upload: %v", statErr)
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// Database dumps can be multiple GB, so allow far longer than a download of a small object
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
 
+	utils.Info("[S3] Uploading to s3://%s/%s ...", pCfg.Bucket, key)
 	if _, err := client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: &pCfg.Bucket,
 		Key:    &key,
@@ -129,6 +140,7 @@ func (cfg *Config) uploadS3Backup(localPath, dbName string) (BackupRef, error) {
 	}); err != nil {
 		return BackupRef{}, fmt.Errorf("failed to upload backup to s3://%s/%s: %w", pCfg.Bucket, key, err)
 	}
+	utils.Success("[S3] Upload completed to s3://%s/%s", pCfg.Bucket, key)
 
 	return BackupRef{Name: filename, Identifier: key}, nil
 }

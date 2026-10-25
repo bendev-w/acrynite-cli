@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -17,22 +18,18 @@ func NewS3Client(cfg *Config, secrets *SecretStore) (*s3.Client, error) {
 		return nil, fmt.Errorf("provider '%s' is not an s3 provider", cfg.Name)
 	}
 
-	accessKey, err := secrets.Get(cfg.Name + ":access_key")
-	if err != nil {
-		return nil, fmt.Errorf("failed to read access key for provider '%s': %w", cfg.Name, err)
-	}
-	secretKey, err := secrets.Get(cfg.Name + ":secret_key")
-	if err != nil {
-		return nil, fmt.Errorf("failed to read secret key for provider '%s': %w", cfg.Name, err)
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
-		awsconfig.WithRegion(cfg.Region),
-		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
-	)
+	// Prefer credentials saved for this profile. If they are absent, defer to
+	// the AWS SDK default chain (environment, shared profile, or IAM role).
+	accessKey, accessErr := secrets.Get(cfg.Name + ":access_key")
+	secretKey, secretErr := secrets.Get(cfg.Name + ":secret_key")
+	options := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(cfg.Region)}
+	if accessErr == nil && secretErr == nil && accessKey != "" && secretKey != "" {
+		options = append(options, awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")))
+	}
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, options...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
@@ -41,6 +38,9 @@ func NewS3Client(cfg *Config, secrets *SecretStore) (*s3.Client, error) {
 		if cfg.Endpoint != "" {
 			o.BaseEndpoint = &cfg.Endpoint
 			o.UsePathStyle = true // most S3-compatible services need path-style addressing
+			// Newer SDKs add default checksums that many S3-compatible services reject
+			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+			o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 		}
 	}), nil
 }

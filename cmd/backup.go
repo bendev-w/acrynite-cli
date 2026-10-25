@@ -9,9 +9,11 @@ import (
 	"acrynite-cli/internal/backup"
 	"acrynite-cli/internal/database"
 	"acrynite-cli/internal/location"
+	"acrynite-cli/internal/pitr"
 	"acrynite-cli/internal/provider"
 	"acrynite-cli/internal/restore"
 	"acrynite-cli/internal/schedule"
+	"acrynite-cli/internal/wal"
 	"acrynite-cli/utils"
 
 	"github.com/AlecAivazis/survey/v2"
@@ -35,10 +37,11 @@ var (
 	locationPrefixFlag   string
 	restoreSchedule      string
 	restoreSourceFilter  string
+	backupMethod         string
 )
 
 // backupCmd represents the backup command
-var backupCmd = &cobra.Command{
+var legacyBackupCmd = &cobra.Command{
 	Use:   "backup",
 	Short: "Manage database backups",
 	Long:  `Create and schedule PostgreSQL database backups using pg_dump.`,
@@ -142,21 +145,27 @@ var backupVerifyCmd = &cobra.Command{
 
 func init() {
 	// Add subcommands
-	backupCmd.AddCommand(backupRunCmd)
-	backupCmd.AddCommand(backupScheduleCmd)
-	backupCmd.AddCommand(backupUnscheduleCmd)
-	backupCmd.AddCommand(backupRegisterCmd)
-	backupCmd.AddCommand(backupListCmd)
-	backupCmd.AddCommand(backupCancelCmd)
-	backupCmd.AddCommand(backupSchedulerCmd)
-	backupCmd.AddCommand(backupRestoreCmd)
-	backupCmd.AddCommand(backupVerifyCmd)
+	legacyBackupCmd.AddCommand(backupRunCmd)
+	legacyBackupCmd.AddCommand(backupScheduleCmd)
+	legacyBackupCmd.AddCommand(backupUnscheduleCmd)
+	legacyBackupCmd.AddCommand(backupRegisterCmd)
+	legacyBackupCmd.AddCommand(backupListCmd)
+	legacyBackupCmd.AddCommand(backupCancelCmd)
+	legacyBackupCmd.AddCommand(backupSchedulerCmd)
+	legacyBackupCmd.AddCommand(backupRestoreCmd)
+	legacyBackupCmd.AddCommand(backupVerifyCmd)
 
 	// Backup run flags
 	backupRunCmd.Flags().StringVar(&backupPath, "path", "./backups", "Path to store backup files")
 	backupRunCmd.Flags().StringVar(&locationName, "location", "", "Upload to this registered location instead of keeping the backup locally")
+	backupRunCmd.Flags().StringVar(&backupMethod, "method", backup.MethodDump, "Backup method: dump (pg_dump/mysqldump) or basebackup (PostgreSQL pg_basebackup for point-in-time recovery)")
 
 	// Backup schedule flags
+	backupScheduleCmd.Flags().StringVar(&walMode, "wal-mode", "auto", "With --method basebackup: auto, stream (pg_receivewal over the replication connection; any OS/container/remote server), direct (archive_command runs this CLI on the database host) or spool (shared folder)")
+	backupScheduleCmd.Flags().StringVar(&walSpoolDir, "wal-spool-dir", "", "With --method basebackup and PostgreSQL in Docker: host folder shared with the container; PostgreSQL copies WAL there and Acrynite uploads it")
+	backupScheduleCmd.Flags().StringVar(&walContainerDir, "wal-container-dir", wal.DefaultContainerSpoolDir, "Path of the shared folder inside the PostgreSQL container")
+	backupScheduleCmd.Flags().StringVar(&walArchiveTimeout, "archive-timeout", "5min", "With --method basebackup: force a WAL segment switch at least this often (e.g. 30s, 5min, 1h; 0 disables)")
+	backupScheduleCmd.Flags().StringVar(&backupMethod, "method", backup.MethodDump, "Backup method: dump (pg_dump/mysqldump) or basebackup (pg_basebackup + continuous WAL archiving for point-in-time recovery)")
 	backupScheduleCmd.Flags().StringVar(&backupInterval, "interval", "daily", "Backup interval (hourly, daily, weekly, or custom duration like 6h, 30m)")
 	backupScheduleCmd.Flags().StringVar(&backupPath, "path", "./backups", "Path to store backup files (local locations only)")
 	backupScheduleCmd.Flags().StringVar(&locationName, "name", "", "Label for the location this schedule writes to (defaults to an auto-generated name)")
@@ -192,6 +201,12 @@ func init() {
 
 func runBackup(cmd *cobra.Command, args []string) error {
 	dbName := args[0]
+	if err := validateBackupMethod(backupMethod); err != nil {
+		return err
+	}
+	if backupMethod == backup.MethodBaseBackup {
+		return runBaseBackupOnce(dbName)
+	}
 	if locationName == "" {
 		return backup.PerformBackup(dbName, backupPath)
 	}
@@ -260,6 +275,10 @@ func validateLocationProvider(locType location.Type, providerName string) error 
 
 func runScheduleBackup(cmd *cobra.Command, args []string) error {
 	dbName := args[0]
+	if err := validateBackupMethod(backupMethod); err != nil {
+		return err
+	}
+	method := backupMethod
 
 	if locationName == "" {
 		locationName = fmt.Sprintf("schedule-%s", utils.Now(utils.TimestampFile))
@@ -321,6 +340,19 @@ func runScheduleBackup(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	if method == backup.MethodBaseBackup {
+		if config.Type != "postgres" {
+			return fmt.Errorf("--method basebackup requires a PostgreSQL database ('%s' is %s)", dbName, config.Type)
+		}
+		utils.Info("Running point-in-time recovery pre-flight checks...")
+		report := pitr.Run(config, pitr.Options{Location: loc, StagingDir: stagingPath, RequireArchive: true, WALSpoolDir: walSpoolDir, WALContainerDir: walContainerDir, WALMode: walMode})
+		report.Log()
+		if err := report.Err(); err != nil {
+			return err
+		}
+		fmt.Println()
+	}
+
 	locMgr, err := location.GetConfigManager()
 	if err != nil {
 		return fmt.Errorf("failed to get location manager: %w", err)
@@ -330,15 +362,35 @@ func runScheduleBackup(cmd *cobra.Command, args []string) error {
 	}
 
 	backupTask := func() error {
+		if method == backup.MethodBaseBackup {
+			utils.Info("[Scheduled] Starting base backup of '%s' into %s location '%s'...", dbName, locType, locationName)
+			ref, err := backup.PerformBaseBackupToLocation(config, dbName, stagingPath, loc)
+			if err != nil {
+				utils.Error("[Scheduled] Base backup failed: %v", err)
+				return err
+			}
+			_ = locMgr.TouchLastBackup(dbName, locationName, time.Now())
+			utils.Success("[Scheduled] Base backup stored: %s", ref.Identifier)
+			return nil
+		}
+
 		timestamp := utils.Now(utils.TimestampBackup)
 		backupFile := filepath.Join(stagingPath, fmt.Sprintf("%s_%s.sql", dbName, timestamp))
 
 		utils.Info("[Scheduled] Starting backup of '%s'...", dbName)
+		utils.Info("[Scheduled] Staging path: %s", stagingPath)
+		utils.Info("[Scheduled] Backup file: %s", backupFile)
+		utils.Info("[Scheduled] Destination type: %s", locType)
+		if locationProviderFlag != "" {
+			utils.Info("[Scheduled] Destination provider: %s", locationProviderFlag)
+		}
 
 		var err error
 		if config.Type == "mysql" {
+			utils.Info("[Scheduled] Running MySQL dump...")
 			err = backup.PerformMySQLDump(config, backupFile)
 		} else {
+			utils.Info("[Scheduled] Running PostgreSQL dump...")
 			err = backup.PerformPostgresDump(config, backupFile)
 		}
 
@@ -346,19 +398,33 @@ func runScheduleBackup(cmd *cobra.Command, args []string) error {
 			utils.Error("[Scheduled] Backup failed: %v", err)
 			return err
 		}
+		utils.Success("[Scheduled] Dump completed: %s", backupFile)
+		if fileInfo, statErr := os.Stat(backupFile); statErr == nil {
+			utils.Info("[Scheduled] Staged backup size: %.2f MB", float64(fileInfo.Size())/(1024*1024))
+		} else {
+			utils.Warning("[Scheduled] Could not stat staged backup: %v", statErr)
+		}
 
+		utils.Info("[Scheduled] Uploading staged backup...")
 		ref, err := loc.UploadBackup(backupFile, dbName)
 		if err != nil {
 			utils.Error("[Scheduled] Upload failed: %v", err)
 			return err
 		}
+
+		utils.Success("[Scheduled] Upload completed: %s", ref.Identifier)
 		if locType != location.TypeLocal {
-			_ = os.Remove(backupFile)
+			utils.Info("[Scheduled] Removing staged file: %s", backupFile)
+			if removeErr := os.Remove(backupFile); removeErr != nil {
+				utils.Warning("[Scheduled] Failed to remove staged file: %v", removeErr)
+			} else {
+				utils.Success("[Scheduled] Removed staged file")
+			}
 		}
 		_ = locMgr.TouchLastBackup(dbName, locationName, time.Now())
 
-		fileSize, _ := utils.GetFileSize(backupFile)
 		if locType == location.TypeLocal {
+			fileSize, _ := utils.GetFileSize(backupFile)
 			utils.Success("[Scheduled] Backup completed: %s (%.2f MB)", ref.Identifier, float64(fileSize)/(1024*1024))
 		} else {
 			utils.Success("[Scheduled] Backup uploaded to %s location '%s': %s", locType, locationName, ref.Name)
@@ -376,8 +442,20 @@ func runScheduleBackup(cmd *cobra.Command, args []string) error {
 	}
 
 	scheduleManager := getOrCreateScheduleManager()
-	if err := scheduleManager.AddSchedule(scheduleID, dbName, interval, stagingPath); err != nil {
+	if err := scheduleManager.AddSchedule(scheduleID, dbName, interval, stagingPath, method); err != nil {
 		utils.Warning("Failed to persist schedule: %v", err)
+	}
+
+	if method == backup.MethodBaseBackup {
+		utils.Info("Enabling WAL archiving for point-in-time recovery...")
+		if _, _, restartRequired, err := enableWALArchiving(scheduleID); err != nil {
+			utils.Error("Could not enable WAL archiving: %v", err)
+			utils.Warning("Base backups will run, but point-in-time recovery needs WAL archiving. Fix the problem above, then run: acrynite backup wal enable %s", scheduleID)
+		} else if restartRequired {
+			utils.Warning("Restart PostgreSQL to activate archive_mode; archive_command has already been saved")
+		} else {
+			utils.Success("WAL archiving enabled; completed WAL segments are archived to location '%s'", locationName)
+		}
 	}
 
 	if !scheduleManager.IsDaemonRunning() {
@@ -401,11 +479,17 @@ func runScheduleBackup(cmd *cobra.Command, args []string) error {
 		utils.Info("Provider: %s", locationProviderFlag)
 	}
 	utils.Info("Interval: %s (%s)", backupInterval, interval)
+	utils.Info("Method: %s", method)
 	if locType == location.TypeLocal {
 		utils.Info("Output path: %s", backupPath)
 	}
 	utils.Info("Schedule ID: %s", scheduleID)
-	utils.Info("Next backup: %s", utils.FormatTimestamp(task.NextRun, utils.TimestampLog))
+	if method == backup.MethodBaseBackup {
+		utils.Info("First base backup: starting now (picked up by the scheduler within 30s)")
+		utils.Info("Following base backups: every %s after each run starts; WAL is archived continuously in between", interval)
+	} else {
+		utils.Info("Next backup: %s", utils.FormatTimestamp(task.NextRun, utils.TimestampLog))
+	}
 
 	fmt.Println()
 	utils.Info("Note: Scheduled backups run while the CLI is active.")
@@ -609,6 +693,15 @@ func runSchedulerDaemon(cmd *cobra.Command, args []string) error {
 	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
 
+	// WAL streaming/upload runs on its own loop so a long base backup never stalls it
+	go func() {
+		manager.ServiceWAL()
+		walTicker := time.NewTicker(checkInterval)
+		defer walTicker.Stop()
+		for range walTicker.C {
+			manager.ServiceWAL()
+		}
+	}()
 	for range ticker.C {
 		// Execute any overdue schedules
 		if err := manager.ExecuteOverdueSchedules(); err != nil {

@@ -66,8 +66,9 @@ var providerRemoveCmd = &cobra.Command{
 }
 
 func init() {
-	rootCmd.AddCommand(providerCmd)
-
+	// Provider management is retained only to read existing configuration. The
+	// public CLI exposes S3 through `storage`, which keeps credentials and
+	// destinations in one PostgreSQL-focused workflow.
 	providerCmd.AddCommand(providerAddCmd)
 	providerCmd.AddCommand(providerListCmd)
 	providerCmd.AddCommand(providerStatusCmd)

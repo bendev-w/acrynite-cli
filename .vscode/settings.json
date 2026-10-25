@@ -1,0 +1,7 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "go": true,
+        "pg_basebackup": true,
+        "psql": true
+    }
+}
