@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -424,19 +425,32 @@ func runDueSchedules(cmd *cobra.Command) error {
 	return nil
 }
 
-var walStorage, walPushFile, walPushName string
+var walStorage, walPath, walPushFile, walPushName string
 var walCmd = &cobra.Command{Use: "wal", Short: "Configure PostgreSQL WAL archiving"}
 var walEnableCmd = &cobra.Command{Use: "enable <registered-database-or-cluster>", Short: "Enable cluster-level WAL archiving to S3", Args: cobra.ExactArgs(1), RunE: runWALEnableV2}
 var walStatusCmd = &cobra.Command{Use: "status <registered-database-or-cluster>", Short: "Show WAL archive status", Args: cobra.ExactArgs(1), RunE: runWALStatusV2}
 var walPushCmd = &cobra.Command{Use: "push <registered-database-or-cluster>", Hidden: true, Args: cobra.ExactArgs(1), RunE: runWALPushV2}
 
 func runWALEnableV2(cmd *cobra.Command, args []string) error {
-	if walStorage == "" {
-		return fmt.Errorf("--storage is required")
+	if (walStorage == "") == (walPath == "") {
+		return fmt.Errorf("exactly one of --storage or --path is required")
 	}
-	_, locator, err := storageLocation(walStorage)
-	if err != nil {
-		return err
+	var locator catalog.StorageLocator
+	if walPath != "" {
+		abs, absErr := filepath.Abs(walPath)
+		if absErr != nil {
+			return absErr
+		}
+		if mkErr := os.MkdirAll(filepath.Join(abs, "wal"), 0755); mkErr != nil {
+			return fmt.Errorf("create WAL directory: %w", mkErr)
+		}
+		locator = catalog.StorageLocator{Provider: "local", Artifact: abs}
+	} else {
+		var locErr error
+		_, locator, locErr = storageLocation(walStorage)
+		if locErr != nil {
+			return locErr
+		}
 	}
 	dbm, err := database.GetConfigManager()
 	if err != nil {
@@ -747,7 +761,11 @@ func runPhysicalRestore(cmd *cobra.Command, m *catalog.Manifest) error {
 	if container == "" {
 		container = "acrynite-" + strings.ReplaceAll(m.ID, "_", "-")
 	}
-	args := []string{"run", "-d", "--name", container, "-v", dataDir + ":/var/lib/postgresql/data", "-v", walDir + ":/wal_archive:ro"}
+	args := []string{"run", "-d", "--name", container, "-e", "PGDATA=/var/lib/postgresql/data", "-v", dataDir + ":/var/lib/postgresql/data", "-v", walDir + ":/wal_archive:ro"}
+	if err := prepareRecoveryOwnership(dataDir, &args); err != nil {
+		_ = os.RemoveAll(recoveryRoot)
+		return err
+	}
 	if restorePublishPort != "" {
 		port, err := strconv.Atoi(restorePublishPort)
 		if err != nil || port < 1 || port > 65535 {
@@ -762,7 +780,50 @@ func runPhysicalRestore(cmd *cobra.Command, m *catalog.Manifest) error {
 		_ = os.RemoveAll(recoveryRoot)
 		return fmt.Errorf("start recovery container: %w: %s", err, strings.TrimSpace(string(output)))
 	}
+	if err := waitForContainer(container); err != nil {
+		return fmt.Errorf("%w\nRecovery data kept at: %s", err, recoveryRoot)
+	}
 	fmt.Fprintf(cmd.OutOrStdout(), "Started isolated recovery container %q from %s. Recovery data: %s\n", container, m.ID, recoveryRoot)
+	return nil
+}
+
+// prepareRecoveryOwnership makes the restored cluster usable by the postgres user inside the container.
+func prepareRecoveryOwnership(dataDir string, args *[]string) error {
+	if err := os.Chmod(dataDir, 0o700); err != nil {
+		return err
+	}
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	uid, gid := os.Getuid(), os.Getgid()
+	if uid == 0 {
+		uid, gid = 999, 999
+		err := filepath.Walk(dataDir, func(p string, _ os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			return os.Lchown(p, uid, gid)
+		})
+		if err != nil {
+			return fmt.Errorf("set recovery data ownership: %w", err)
+		}
+	}
+	// Insert --user right after "run" so it precedes the image name.
+	a := *args
+	*args = append([]string{a[0], "--user", fmt.Sprintf("%d:%d", uid, gid)}, a[1:]...)
+	return nil
+}
+
+// waitForContainer fails if the recovery container exits shortly after start.
+func waitForContainer(container string) error {
+	for i := 0; i < 5; i++ {
+		time.Sleep(time.Second)
+		out, err := exec.Command("docker", "inspect", "-f", "{{.State.Running}}", container).Output()
+		if err != nil || strings.TrimSpace(string(out)) != "true" {
+			logs, _ := exec.Command("docker", "logs", "--tail", "20", container).CombinedOutput()
+			return fmt.Errorf("recovery container %q exited during startup:\n%s", container, strings.TrimSpace(string(logs)))
+		}
+	}
 	return nil
 }
 
@@ -921,6 +982,7 @@ func init() {
 	scheduleListCmd.Flags().StringVar(&flowFormat, "format", "table", "table or json")
 	walCmd.AddCommand(walEnableCmd, walStatusCmd, walPushCmd)
 	walEnableCmd.Flags().StringVar(&walStorage, "storage", "", "Registered S3 storage")
+	walEnableCmd.Flags().StringVar(&walPath, "path", "", "Local directory for WAL files (must be writable by PostgreSQL)")
 	walPushCmd.Flags().StringVar(&walPushFile, "file", "", "WAL source file")
 	walPushCmd.Flags().StringVar(&walPushName, "name", "", "WAL segment name")
 	recoveryPointsCmd.AddCommand(recoveryPointsListCmd)
@@ -955,6 +1017,9 @@ func storageLocation(name string) (*location.Config, catalog.StorageLocator, err
 	return loc, catalog.StorageLocator{Profile: name, Provider: "s3", Bucket: p.Bucket, Prefix: prefix}, nil
 }
 func locationFromLocator(v catalog.StorageLocator) (*location.Config, error) {
+	if v.Provider == "local" && v.Artifact != "" {
+		return &location.Config{Type: location.TypeLocal, Path: v.Artifact}, nil
+	}
 	if v.Provider != "s3" || v.Profile == "" {
 		return nil, fmt.Errorf("unsupported storage locator %q", v.Provider)
 	}

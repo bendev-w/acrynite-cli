@@ -179,6 +179,7 @@ WAL archiving is configured once per PostgreSQL cluster, not per schedule:
 
 ```powershell
 acrynite wal enable <registered-database-or-cluster> --storage <registered-s3-storage>
+acrynite wal enable <registered-database-or-cluster> --path /var/lib/acrynite/wal
 acrynite wal status <registered-database-or-cluster>
 acrynite recovery-points list --database production
 ```
