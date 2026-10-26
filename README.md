@@ -8,18 +8,6 @@ an isolated Docker container.
 This version supports PostgreSQL and S3/S3-compatible storage only. The older
 `db`, `provider`, and `backup schedule` command flows are not public commands.
 
-## Requirements
-
-- Go 1.26+ to build from source.
-- PostgreSQL client tools in `PATH`: `pg_dump` for logical backups and
-  `pg_basebackup` for physical backups.
-- AWS credentials from the normal AWS chain (environment, shared profile, or
-  IAM role), or supplied during storage registration.
-- Docker running for physical restores to `--target docker`.
-
-Physical backup and WAL setup require a replication-capable PostgreSQL role and
-server-level access. An application role normally does not have these rights.
-
 ## Install (no Go required)
 
 Linux / macOS:
@@ -34,7 +22,23 @@ Windows (PowerShell):
 irm https://raw.githubusercontent.com/bendev-w/acrynite-cli/main/install.ps1 | iex
 ```
 
-Or download an archive for your platform from the
+Verify with `acrynite version`.
+
+## Requirements
+
+- Go 1.26+ only if building from source.
+- PostgreSQL client tools in `PATH`: `pg_dump` for logical backups and
+  `pg_basebackup` for physical backups.
+- AWS credentials from the normal AWS chain (environment, shared profile, or
+  IAM role), or supplied during storage registration.
+- Docker running for physical restores to `--target docker`.
+
+Physical backup and WAL setup require a replication-capable PostgreSQL role and
+server-level access. An application role normally does not have these rights.
+
+## Other install options
+
+Download an archive for your platform from the
 [Releases](https://github.com/bendev-w/acrynite-cli/releases) page. Set
 `ACRYNITE_VERSION` or `ACRYNITE_INSTALL_DIR` to pin a version or change the
 install location.
