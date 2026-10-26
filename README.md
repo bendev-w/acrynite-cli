@@ -20,6 +20,27 @@ This version supports PostgreSQL and S3/S3-compatible storage only. The older
 Physical backup and WAL setup require a replication-capable PostgreSQL role and
 server-level access. An application role normally does not have these rights.
 
+## Install (no Go required)
+
+Linux / macOS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bendev-w/acrynite-cli/main/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/bendev-w/acrynite-cli/main/install.ps1 | iex
+```
+
+Or download an archive for your platform from the
+[Releases](https://github.com/bendev-w/acrynite-cli/releases) page. Set
+`ACRYNITE_VERSION` or `ACRYNITE_INSTALL_DIR` to pin a version or change the
+install location.
+
+Releases are published by pushing a tag: `git tag v0.1.0 && git push origin v0.1.0`.
+
 ## Build
 
 ```powershell
