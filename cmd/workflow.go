@@ -761,7 +761,12 @@ func runPhysicalRestore(cmd *cobra.Command, m *catalog.Manifest) error {
 	if container == "" {
 		container = "acrynite-" + strings.ReplaceAll(m.ID, "_", "-")
 	}
-	args := []string{"run", "-d", "--name", container, "-e", "PGDATA=/var/lib/postgresql/data", "-v", dataDir + ":/var/lib/postgresql/data", "-v", walDir + ":/wal_archive:ro"}
+	if err := removeStaleContainer(container); err != nil {
+		_ = os.RemoveAll(recoveryRoot)
+		return err
+	}
+	pgData := pgDataPath(m.PostgresVersion)
+	args := []string{"run", "-d", "--name", container, "--label", recoveryLabel + "=" + m.ID, "-e", "PGDATA=" + pgData, "-v", dataDir + ":" + pgData, "-v", walDir + ":/wal_archive:ro"}
 	if err := prepareRecoveryOwnership(dataDir, &args); err != nil {
 		_ = os.RemoveAll(recoveryRoot)
 		return err
@@ -777,8 +782,7 @@ func runPhysicalRestore(cmd *cobra.Command, m *catalog.Manifest) error {
 	args = append(args, postgresImage(m.PostgresVersion))
 	output, err := exec.Command("docker", args...).CombinedOutput()
 	if err != nil {
-		_ = os.RemoveAll(recoveryRoot)
-		return fmt.Errorf("start recovery container: %w: %s", err, strings.TrimSpace(string(output)))
+		return fmt.Errorf("start recovery container: %w: %s\nRecovery data kept at: %s", err, strings.TrimSpace(string(output)), recoveryRoot)
 	}
 	if err := waitForContainer(container); err != nil {
 		return fmt.Errorf("%w\nRecovery data kept at: %s", err, recoveryRoot)
@@ -846,13 +850,21 @@ func extractBaseBackup(archivePath, dataDir string) error {
 		if header.Typeflag != tar.TypeReg || (filepath.Base(header.Name) != "base.tar.gz" && filepath.Base(header.Name) != "pg_wal.tar.gz") {
 			continue
 		}
-		if err := extractGzipTar(outer, dataDir); err != nil {
+		// pg_wal.tar holds bare segment files, so it belongs under pg_wal/.
+		dest := dataDir
+		if filepath.Base(header.Name) == "pg_wal.tar.gz" {
+			dest = filepath.Join(dataDir, "pg_wal")
+		}
+		if err := extractGzipTar(outer, dest); err != nil {
 			return err
 		}
 		found = true
 	}
 	if !found {
 		return fmt.Errorf("physical backup does not contain pg_basebackup tar files")
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "PG_VERSION")); err != nil {
+		return fmt.Errorf("extracted backup is not a PostgreSQL data directory (PG_VERSION missing): %w", err)
 	}
 	return nil
 }
@@ -903,6 +915,9 @@ func extractGzipTar(source io.Reader, destination string) error {
 }
 
 func configureRecovery(dataDir, targetTime string, hasWAL bool) error {
+	if err := ensureServerConfigFiles(dataDir); err != nil {
+		return err
+	}
 	config := "\nrecovery_target_action = 'promote'\n"
 	if !hasWAL {
 		// Base backup only: stop at the first consistent point using the WAL bundled in the backup.
@@ -916,7 +931,7 @@ func configureRecovery(dataDir, targetTime string, hasWAL bool) error {
 	if err := os.WriteFile(filepath.Join(dataDir, "recovery.signal"), []byte{}, 0o600); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(filepath.Join(dataDir, "postgresql.auto.conf"), os.O_APPEND|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(filepath.Join(dataDir, "postgresql.auto.conf"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -926,6 +941,64 @@ func configureRecovery(dataDir, targetTime string, hasWAL bool) error {
 		return err
 	}
 	return closeErr
+}
+
+const recoveryLabel = "acrynite.recovery-backup"
+
+// removeStaleContainer removes a previous Acrynite recovery container so the attempt can be repeated.
+func removeStaleContainer(name string) error {
+	out, err := exec.Command("docker", "inspect", "-f", `{{index .Config.Labels "`+recoveryLabel+`"}}`, name).CombinedOutput()
+	if err != nil {
+		if strings.Contains(string(out), "No such") {
+			return nil
+		}
+		return fmt.Errorf("inspect container %q: %w: %s", name, err, strings.TrimSpace(string(out)))
+	}
+	if strings.TrimSpace(string(out)) == "" {
+		return fmt.Errorf("container %q exists and was not created by Acrynite; remove it or use --container-name", name)
+	}
+	if out, err := exec.Command("docker", "rm", "-f", name).CombinedOutput(); err != nil {
+		return fmt.Errorf("remove previous recovery container %q: %w: %s", name, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func postgresMajor(version string) int {
+	for _, field := range strings.Fields(version) {
+		if n, err := strconv.Atoi(strings.Split(field, ".")[0]); err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
+// pgDataPath follows the official image layout: PostgreSQL 18+ keeps data under /var/lib/postgresql/<major>/docker.
+func pgDataPath(version string) string {
+	if major := postgresMajor(version); major >= 18 {
+		return fmt.Sprintf("/var/lib/postgresql/%d/docker", major)
+	}
+	return "/var/lib/postgresql/data"
+}
+
+// ensureServerConfigFiles supplies configs that live outside PGDATA on Debian/Ubuntu and are absent from the backup.
+func ensureServerConfigFiles(dataDir string) error {
+	files := []struct{ name, content string }{
+		{"postgresql.conf", "listen_addresses = '*'\nport = 5432\nmax_connections = 100\n"},
+		{"pg_hba.conf", "local all all trust\nhost all all 0.0.0.0/0 scram-sha-256\n"},
+		{"pg_ident.conf", ""},
+	}
+	for _, f := range files {
+		path := filepath.Join(dataDir, f.name)
+		if _, err := os.Stat(path); err == nil {
+			continue
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		if err := os.WriteFile(path, []byte(f.content), 0o600); err != nil {
+			return fmt.Errorf("write default %s: %w", f.name, err)
+		}
+	}
+	return nil
 }
 
 func postgresImage(version string) string {
