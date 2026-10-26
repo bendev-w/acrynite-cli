@@ -70,21 +70,12 @@ completed runs remain discoverable after their schedule changes.
 
 ## Quick start
 
-```powershell
+```sh
 # Register a source PostgreSQL profile.
-acrynite database register production `
-  --host db.example.com `
-  --port 5432 `
-  --username acrynite_backup `
-  --database app_db `
-  --ssl-mode require
+acrynite database register production --host db.example.com --port 5432 --username acrynite_backup --database app_db --ssl-mode require
 
 # Register an S3 backup destination.
-acrynite storage register s3-prod-backups `
-  --provider s3 `
-  --bucket company-backups `
-  --prefix acrynite/production `
-  --region eu-west-1
+acrynite storage register s3-prod-backups --provider s3 --bucket company-backups --prefix acrynite/production --region eu-west-1
 
 acrynite database test-connection production
 acrynite backup run --database production --type logical --storage s3-prod-backups
@@ -94,11 +85,8 @@ acrynite wal enable production --storage s3-prod-backups
 
 ## Database profiles
 
-```powershell
-acrynite database register <name> `
-  --host <hostname> `
-  --username <username> `
-  --database <database-name>
+```sh
+acrynite database register <name> --host <hostname> --username <username> --database <database-name>
 ```
 
 Optional flags: `--port` (default `5432`), `--ssl-mode`, `--dump-path`, and
@@ -118,13 +106,8 @@ acrynite database test-connection production
 
 Registered storage is S3-only:
 
-```powershell
-acrynite storage register <name> `
-  --provider s3 `
-  --bucket <bucket> `
-  --prefix <optional-prefix> `
-  --region <region> `
-  --endpoint <optional-s3-compatible-endpoint>
+```sh
+acrynite storage register <name> --provider s3 --bucket <bucket> --prefix <optional-prefix> --region <region> --endpoint <optional-s3-compatible-endpoint>
 ```
 
 The preferred authentication method is the AWS credential chain. For a local
@@ -138,11 +121,8 @@ acrynite storage list --format json
 
 ## One-time backups
 
-```powershell
-acrynite backup run `
-  --database <registered-database> `
-  --type <physical|logical> `
-  (--storage <registered-s3-storage> | --path <local-directory>)
+```sh
+acrynite backup run --database <registered-database> --type <physical|logical> (--storage <registered-s3-storage> | --path <local-directory>)
 ```
 
 `--storage` and `--path` are mutually exclusive. `--path` is a one-off local
@@ -175,22 +155,14 @@ acrynite backup show bkp_20261023_030000_a1b2
 
 ## Scheduled backups
 
-```powershell
-acrynite schedule create <schedule-name> `
-  --database <registered-database> `
-  --type <physical|logical> `
-  --interval <duration> `
-  (--storage <registered-s3-storage> | --path <local-directory>)
+```sh
+acrynite schedule create <schedule-name> --database <registered-database> --type <physical|logical> --interval <duration> (--storage <registered-s3-storage> | --path <local-directory>)
 ```
 
 Intervals use Go duration syntax: `24h`, `6h`, or `168h`.
 
-```powershell
-acrynite schedule create production-daily `
-  --database production `
-  --type physical `
-  --interval 24h `
-  --storage s3-prod-backups
+```sh
+acrynite schedule create production-daily --database production --type physical --interval 24h --storage s3-prod-backups
 
 acrynite schedule list
 acrynite schedule list --database production
@@ -229,11 +201,8 @@ PostgreSQL recovery validates actual WAL continuity.
 
 Preview a physical restore before moving artifacts or starting Docker:
 
-```powershell
-acrynite restore plan `
-  --database production `
-  --target-time "2026-10-23T14:30:00Z" `
-  --target docker
+```sh
+acrynite restore plan --database production --target-time "2026-10-23T14:30:00Z" --target docker
 
 acrynite restore plan --backup-id bkp_20261022_030000_c3d4 --target docker
 acrynite restore plan --database production --latest --target docker
@@ -245,17 +214,12 @@ provided, Acrynite chooses a completed physical backup for `--database`.
 
 ### Physical recovery to Docker
 
-```powershell
+```sh
 # Recover as far forward as available WAL permits.
-acrynite restore run `
-  --backup-id bkp_20261022_030000_c3d4 `
-  --target docker
+acrynite restore run --backup-id bkp_20261022_030000_c3d4 --target docker
 
 # Recover to a specific UTC point in time.
-acrynite restore run `
-  --backup-id bkp_20261022_030000_c3d4 `
-  --target docker `
-  --target-time "2026-10-23T14:30:00Z"
+acrynite restore run --backup-id bkp_20261022_030000_c3d4 --target docker --target-time "2026-10-23T14:30:00Z"
 ```
 
 Acrynite downloads the base backup and recorded S3 WAL archive into a new local
@@ -270,10 +234,8 @@ timeline.
 
 ### Logical restore
 
-```powershell
-acrynite restore run `
-  --backup-id bkp_20261020_030000_a7b8 `
-  --target-database staging
+```sh
+acrynite restore run --backup-id bkp_20261020_030000_a7b8 --target-database staging
 ```
 
 Logical backups are imported through `psql` into a registered target profile.
