@@ -12,6 +12,9 @@ var (
 		Use:   "acrynite",
 		Short: "PostgreSQL backup and recovery CLI",
 		Long:  "Acrynite registers PostgreSQL clusters and S3 destinations, then manages backups and recovery metadata.",
+		// Runtime failures are not usage mistakes; Execute prints the error once.
+		SilenceUsage:  true,
+		SilenceErrors: true,
 		Run: func(cmd *cobra.Command, args []string) {
 			// Default behavior when no subcommand is specified
 			fmt.Println("Acrynite PostgreSQL backup and recovery CLI")

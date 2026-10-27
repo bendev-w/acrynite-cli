@@ -949,7 +949,8 @@ const recoveryLabel = "acrynite.recovery-backup"
 func removeStaleContainer(name string) error {
 	out, err := exec.Command("docker", "inspect", "-f", `{{index .Config.Labels "`+recoveryLabel+`"}}`, name).CombinedOutput()
 	if err != nil {
-		if strings.Contains(string(out), "No such") {
+		// Docker versions differ in casing: "No such object" vs "error: no such object".
+		if strings.Contains(strings.ToLower(string(out)), "no such") {
 			return nil
 		}
 		return fmt.Errorf("inspect container %q: %w: %s", name, err, strings.TrimSpace(string(out)))
