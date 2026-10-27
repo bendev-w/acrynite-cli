@@ -466,10 +466,6 @@ func runWALEnableV2(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	defer db.Close()
-	var dataDir string
-	if err = db.QueryRow("SHOW data_directory").Scan(&dataDir); err != nil {
-		return fmt.Errorf("read PostgreSQL data directory: %w", err)
-	}
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -478,7 +474,7 @@ func runWALEnableV2(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	archiveCommand := buildDatabaseArchiveCommand(exe, wd, dataDir, args[0])
+	archiveCommand := buildDatabaseArchiveCommand(exe, wd, args[0])
 	restart, err := wal.EnableArchive(db, archiveCommand, "5min")
 	if err != nil {
 		return err
@@ -1276,12 +1272,16 @@ func databaseStatus(ok bool) string {
 	}
 	return "not tested"
 }
-func buildDatabaseArchiveCommand(executable, workingDir, dataDirectory, databaseName string) string {
-	source := filepath.Join(dataDirectory, "%p")
+
+// buildDatabaseArchiveCommand builds an archive_command that needs no knowledge of the server's
+// data directory: PostgreSQL runs it from the data directory with %p relative to it, so the
+// command captures that directory before changing into workingDir.
+func buildDatabaseArchiveCommand(executable, workingDir, databaseName string) string {
 	if strings.HasSuffix(strings.ToLower(executable), ".exe") {
 		q := func(s string) string { return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"` }
-		return fmt.Sprintf("cd /d %s && %s wal push %s --file %s --name %s", q(workingDir), q(executable), q(databaseName), q(source), q("%f"))
+		// cmd.exe expands %CD% when the line is parsed, before "cd /d" runs; %% is PostgreSQL's escape for %.
+		return fmt.Sprintf("cd /d %s && %s wal push %s --file %s --name %s", q(workingDir), q(executable), q(databaseName), q(`%%CD%%\%p`), q("%f"))
 	}
 	q := func(s string) string { return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'" }
-	return fmt.Sprintf("cd %s && %s wal push %s --file %s --name %s", q(workingDir), q(executable), q(databaseName), q(source), q("%f"))
+	return fmt.Sprintf(`ACRYNITE_PGDATA="$PWD" && cd %s && %s wal push %s --file "$ACRYNITE_PGDATA/%%p" --name %s`, q(workingDir), q(executable), q(databaseName), q("%f"))
 }
