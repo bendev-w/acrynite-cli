@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -725,33 +726,32 @@ func runPhysicalRestore(cmd *cobra.Command, m *catalog.Manifest) error {
 		_ = os.RemoveAll(recoveryRoot)
 		return err
 	}
-	walDir := filepath.Join(recoveryRoot, "wal_archive")
+	// Validate everything recovery depends on before Docker is involved.
+	var walDir string
 	if hasWAL {
-		walLoc, err := locationFromLocator(*m.WALStorage)
-		if err != nil {
+		if walDir, err = prepareWALArchive(*m.WALStorage, recoveryRoot); err != nil {
 			_ = os.RemoveAll(recoveryRoot)
 			return err
 		}
-		walLoc.Prefix = strings.Trim(walLoc.Prefix, "/")
-		if walLoc.Prefix != "" {
-			walLoc.Prefix += "/"
-		}
-		walLoc.Prefix += "wal"
-		segments, err := walLoc.DownloadPrefix(walDir)
+		warning, err := validateWALArchive(dataDir, walDir, restoreTargetTime != "")
 		if err != nil {
 			_ = os.RemoveAll(recoveryRoot)
-			return fmt.Errorf("download WAL archive: %w", err)
+			return fmt.Errorf("WAL destination %s: %w", displayStorage(*m.WALStorage), err)
 		}
-		if len(segments) == 0 {
-			_ = os.RemoveAll(recoveryRoot)
-			return fmt.Errorf("no archived WAL segments were found; refusing an unsafe physical restore")
+		if warning != "" {
+			fmt.Fprintln(cmd.OutOrStdout(), "Warning: "+warning)
+		}
+		if restoreTargetTime != "" {
+			fmt.Fprintf(cmd.OutOrStdout(), "Point-in-time recovery to %s using WAL from %s.\n", restoreTargetTime, displayStorage(*m.WALStorage))
+		} else {
+			fmt.Fprintf(cmd.OutOrStdout(), "Recovering to the end of the WAL archive at %s.\n", displayStorage(*m.WALStorage))
 		}
 	} else {
-		fmt.Fprintln(cmd.OutOrStdout(), "No WAL destination recorded: restoring the base backup state only (no point-in-time recovery).")
-		if err := os.MkdirAll(walDir, 0o755); err != nil {
+		if err := validateBundledWAL(dataDir); err != nil {
 			_ = os.RemoveAll(recoveryRoot)
 			return err
 		}
+		fmt.Fprintln(cmd.OutOrStdout(), "No WAL destination recorded: restoring the base backup state only (no point-in-time recovery).")
 	}
 	if err := configureRecovery(dataDir, restoreTargetTime, hasWAL); err != nil {
 		_ = os.RemoveAll(recoveryRoot)
@@ -766,7 +766,10 @@ func runPhysicalRestore(cmd *cobra.Command, m *catalog.Manifest) error {
 		return err
 	}
 	pgData := pgDataPath(m.PostgresVersion)
-	args := []string{"run", "-d", "--name", container, "--label", recoveryLabel + "=" + m.ID, "-e", "PGDATA=" + pgData, "-v", dataDir + ":" + pgData, "-v", walDir + ":/wal_archive:ro"}
+	args := []string{"run", "-d", "--name", container, "--label", recoveryLabel + "=" + m.ID, "-e", "PGDATA=" + pgData, "-v", dataDir + ":" + pgData}
+	if hasWAL {
+		args = append(args, "-v", walDir+":"+walArchiveMount+":ro")
+	}
 	if err := prepareRecoveryOwnership(dataDir, &args); err != nil {
 		_ = os.RemoveAll(recoveryRoot)
 		return err
@@ -914,22 +917,35 @@ func extractGzipTar(source io.Reader, destination string) error {
 	}
 }
 
+// walArchiveMount is where the WAL archive is mounted inside the recovery container.
+const walArchiveMount = "/wal_archive"
+
+// configureRecovery prepares dataDir for one of two modes:
+//   - base backup only (hasWAL false): no recovery.signal, so PostgreSQL performs crash recovery
+//     from backup_label with the WAL bundled in pg_wal and never asks for a restore_command;
+//   - point-in-time recovery: recovery.signal plus a restore_command reading the mounted archive,
+//     replaying to targetTime (or the end of the archive) before promoting.
 func configureRecovery(dataDir, targetTime string, hasWAL bool) error {
 	if err := ensureServerConfigFiles(dataDir); err != nil {
 		return err
 	}
-	config := "\nrecovery_target_action = 'promote'\n"
-	if !hasWAL {
-		// Base backup only: stop at the first consistent point using the WAL bundled in the backup.
-		config += "recovery_target = 'immediate'\n"
-	} else {
-		config += "restore_command = 'cp /wal_archive/%f %p'\n"
+	for _, signal := range []string{"recovery.signal", "standby.signal"} {
+		if err := os.Remove(filepath.Join(dataDir, signal)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
-	if targetTime != "" {
-		config += "recovery_target_time = '" + strings.ReplaceAll(targetTime, "'", "''") + "'\n"
-	}
-	if err := os.WriteFile(filepath.Join(dataDir, "recovery.signal"), []byte{}, 0o600); err != nil {
-		return err
+	// The backup carries the source server's archive_command; a recovered copy must never
+	// push its WAL into the production archive.
+	config := "\n# Added by Acrynite restore\narchive_mode = 'off'\n"
+	if hasWAL {
+		config += "restore_command = 'test -f " + walArchiveMount + "/%f && cp " + walArchiveMount + "/%f %p'\n"
+		config += "recovery_target_action = 'promote'\n"
+		if targetTime != "" {
+			config += "recovery_target_time = '" + strings.ReplaceAll(targetTime, "'", "''") + "'\n"
+		}
+		if err := os.WriteFile(filepath.Join(dataDir, "recovery.signal"), []byte{}, 0o600); err != nil {
+			return err
+		}
 	}
 	f, err := os.OpenFile(filepath.Join(dataDir, "postgresql.auto.conf"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -941,6 +957,98 @@ func configureRecovery(dataDir, targetTime string, hasWAL bool) error {
 		return err
 	}
 	return closeErr
+}
+
+var (
+	walSegmentName  = regexp.MustCompile(`^[0-9A-F]{24}$`)
+	backupLabelFile = regexp.MustCompile(`START WAL LOCATION: \S+ \(file ([0-9A-F]{24})\)`)
+)
+
+// backupStartSegment reads the first WAL segment the base backup needs from backup_label.
+func backupStartSegment(dataDir string) (string, error) {
+	label, err := os.ReadFile(filepath.Join(dataDir, "backup_label"))
+	if err != nil {
+		return "", fmt.Errorf("physical backup has no readable backup_label: %w", err)
+	}
+	match := backupLabelFile.FindSubmatch(label)
+	if match == nil {
+		return "", fmt.Errorf("backup_label does not name a START WAL LOCATION segment")
+	}
+	return string(match[1]), nil
+}
+
+// validateBundledWAL checks that a base-only restore can reach consistency from pg_wal alone.
+func validateBundledWAL(dataDir string) error {
+	start, err := backupStartSegment(dataDir)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "pg_wal", start)); err != nil {
+		return fmt.Errorf("base backup does not include WAL segment %s in pg_wal and has no WAL destination, so it cannot be recovered: %w", start, err)
+	}
+	return nil
+}
+
+// prepareWALArchive returns a host directory holding the archived WAL, to be mounted read-only
+// into the container. Local archives are used in place; S3 archives are downloaded first.
+func prepareWALArchive(locator catalog.StorageLocator, recoveryRoot string) (string, error) {
+	loc, err := locationFromLocator(locator)
+	if err != nil {
+		return "", fmt.Errorf("WAL destination %s is unavailable: %w", displayStorage(locator), err)
+	}
+	if loc.Type == location.TypeLocal {
+		dir := filepath.Join(loc.Path, "wal")
+		info, err := os.Stat(dir)
+		if err != nil {
+			return "", fmt.Errorf("local WAL archive %s is unavailable: %w", dir, err)
+		}
+		if !info.IsDir() {
+			return "", fmt.Errorf("local WAL archive %s is not a directory", dir)
+		}
+		return dir, nil
+	}
+	loc.Prefix = strings.Trim(loc.Prefix, "/")
+	if loc.Prefix != "" {
+		loc.Prefix += "/"
+	}
+	loc.Prefix += "wal"
+	dir := filepath.Join(recoveryRoot, "wal_archive")
+	if _, err := loc.DownloadPrefix(dir); err != nil {
+		return "", fmt.Errorf("download WAL archive from %s: %w", displayStorage(locator), err)
+	}
+	return dir, nil
+}
+
+// validateWALArchive checks that walDir holds archived segments reaching past the start of the
+// base backup. When the archive stops before that point a target time can never be reached, so
+// it is an error; recovering to the end of the archive only warrants a warning.
+func validateWALArchive(dataDir, walDir string, hasTargetTime bool) (string, error) {
+	start, err := backupStartSegment(dataDir)
+	if err != nil {
+		return "", err
+	}
+	entries, err := os.ReadDir(walDir)
+	if err != nil {
+		return "", fmt.Errorf("read WAL archive: %w", err)
+	}
+	latest := ""
+	for _, e := range entries {
+		// Compare log/segment numbers only; a promoted server continues on a higher timeline.
+		if !e.IsDir() && walSegmentName.MatchString(e.Name()) && (latest == "" || e.Name()[8:] > latest[8:]) {
+			latest = e.Name()
+		}
+	}
+	if latest == "" {
+		return "", fmt.Errorf("no archived WAL segments found; point-in-time recovery is impossible")
+	}
+	if latest[8:] < start[8:] {
+		msg := fmt.Sprintf("archived WAL ends at %s, before the base backup starts at %s", latest, start)
+		if hasTargetTime {
+			return "", fmt.Errorf("%s; the requested --target-time cannot be reached", msg)
+		}
+		return msg + "; recovery will stop at the end of the base backup", nil
+	}
+	return "", nil
 }
 
 const recoveryLabel = "acrynite.recovery-backup"
