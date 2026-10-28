@@ -229,7 +229,10 @@ func runBackupV2(cmd *cobra.Command, _ []string) error {
 		manifest.Storage = locator
 		destDir = filepath.Join(os.TempDir(), "acrynite", id)
 	} else {
-		destDir = backupPathV2
+		// Record an absolute path so restores work from any working directory.
+		if destDir, err = filepath.Abs(backupPathV2); err != nil {
+			return err
+		}
 		manifest.Storage = catalog.StorageLocator{Provider: "local", Artifact: ""}
 	}
 	if err = os.MkdirAll(destDir, 0755); err != nil {
@@ -688,16 +691,13 @@ func runRestorePlan(cmd *cobra.Command, _ []string) error {
 	return nil
 }
 func runRestoreRun(cmd *cobra.Command, _ []string) error {
+	// Same selection as 'restore plan', so a previewed plan runs against the same backup.
+	m, err := selectRestoreBackup()
+	if err != nil {
+		return err
+	}
 	if restoreBackupID == "" {
-		return fmt.Errorf("--backup-id is required for restore run")
-	}
-	c, err := catalog.NewManager()
-	if err != nil {
-		return err
-	}
-	m, err := c.GetBackup(restoreBackupID)
-	if err != nil {
-		return err
+		fmt.Fprintf(cmd.OutOrStdout(), "Selected backup %s (completed %s)\n", m.ID, m.CompletedAt.Format(time.RFC3339))
 	}
 	if m.Status != catalog.StatusCompleted {
 		return fmt.Errorf("backup %q is not completed", m.ID)

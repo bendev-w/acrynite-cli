@@ -137,7 +137,7 @@ acrynite backup run --database production --type logical --storage s3-prod-backu
 acrynite backup run --database production --type physical --storage s3-prod-backups
 
 # Local, one-off logical dump.
-acrynite backup run --database production --type logical --path .\backups\production
+acrynite backup run --database production --type logical --path ./backups/production
 ```
 
 Every run gets a unique ID such as `bkp_20261023_030000_a1b2`. Its manifest
