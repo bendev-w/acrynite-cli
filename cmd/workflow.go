@@ -644,9 +644,9 @@ func selectRestoreBackup() (*catalog.Manifest, error) {
 		return nil, fmt.Errorf("no completed physical backups found for %q", restoreDatabase)
 	}
 	if restoreTargetTime != "" {
-		target, err := time.Parse(time.RFC3339, restoreTargetTime)
+		target, err := parseTargetTime(restoreTargetTime, time.Now())
 		if err != nil {
-			return nil, fmt.Errorf("--target-time must be ISO 8601/RFC3339: %w", err)
+			return nil, err
 		}
 		for _, v := range items {
 			if !v.CompletedAt.After(target) {
@@ -657,12 +657,37 @@ func selectRestoreBackup() (*catalog.Manifest, error) {
 	}
 	return items[0], nil
 }
+
+// parseTargetTime validates --target-time. A target after now can never be reached: PostgreSQL
+// would replay the whole archive and then refuse to start.
+func parseTargetTime(value string, now time.Time) (time.Time, error) {
+	target, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("--target-time must be ISO 8601/RFC3339, e.g. 2026-10-28T15:30:00Z: %w", err)
+	}
+	if target.After(now) {
+		return time.Time{}, fmt.Errorf("--target-time %s is in the future (now %s); omit it to recover to the latest archived WAL", target.UTC().Format(time.RFC3339), now.UTC().Format(time.RFC3339))
+	}
+	return target, nil
+}
+
+// postgresTargetTime renders t for recovery_target_time. PostgreSQL parses that setting before
+// timezone abbreviations are loaded, so "Z" is rejected; a numeric UTC offset always works.
+func postgresTargetTime(t time.Time) string {
+	return t.UTC().Format("2006-01-02 15:04:05.999999") + "+00"
+}
+
 func runRestorePlan(cmd *cobra.Command, _ []string) error {
 	if restoreTarget != "docker" {
 		return fmt.Errorf("physical restore requires --target docker")
 	}
 	if restoreLatest && restoreTargetTime != "" {
 		return fmt.Errorf("--latest and --target-time are mutually exclusive")
+	}
+	if restoreTargetTime != "" {
+		if _, err := parseTargetTime(restoreTargetTime, time.Now()); err != nil {
+			return err
+		}
 	}
 	m, err := selectRestoreBackup()
 	if err != nil {
@@ -739,11 +764,13 @@ func runPhysicalRestore(cmd *cobra.Command, m *catalog.Manifest) error {
 	if _, err := exec.LookPath("docker"); err != nil {
 		return fmt.Errorf("Docker is required: %w", err)
 	}
+	var recoveryTarget string
 	if restoreTargetTime != "" {
-		target, err := time.Parse(time.RFC3339, restoreTargetTime)
+		target, err := parseTargetTime(restoreTargetTime, time.Now())
 		if err != nil {
-			return fmt.Errorf("--target-time must be ISO 8601/RFC3339: %w", err)
+			return err
 		}
+		recoveryTarget = postgresTargetTime(target)
 		if target.Before(m.CompletedAt) {
 			return fmt.Errorf("requested recovery time predates the selected base backup (%s)", m.CompletedAt.Format(time.RFC3339))
 		}
@@ -789,7 +816,7 @@ func runPhysicalRestore(cmd *cobra.Command, m *catalog.Manifest) error {
 		}
 		fmt.Fprintln(cmd.OutOrStdout(), "No WAL destination recorded: restoring the base backup state only (no point-in-time recovery).")
 	}
-	if err := configureRecovery(dataDir, restoreTargetTime, hasWAL); err != nil {
+	if err := configureRecovery(dataDir, recoveryTarget, hasWAL); err != nil {
 		_ = os.RemoveAll(recoveryRoot)
 		return err
 	}

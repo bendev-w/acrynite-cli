@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const testStartSegment = "000000010000000000000004"
@@ -61,7 +62,7 @@ func TestConfigureRecoveryBaseOnly(t *testing.T) {
 
 func TestConfigureRecoveryPITR(t *testing.T) {
 	dir := newRestoredDataDir(t, true)
-	if err := configureRecovery(dir, "2026-10-26T21:00:00Z", true); err != nil {
+	if err := configureRecovery(dir, "2026-10-26 21:00:00+00", true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "recovery.signal")); err != nil {
@@ -73,13 +74,33 @@ func TestConfigureRecoveryPITR(t *testing.T) {
 	conf := readAutoConf(t, dir)
 	for _, want := range []string{
 		"restore_command = 'test -f /wal_archive/%f && cp /wal_archive/%f %p'",
-		"recovery_target_time = '2026-10-26T21:00:00Z'",
+		"recovery_target_time = '2026-10-26 21:00:00+00'",
 		"recovery_target_action = 'promote'",
 		"archive_mode = 'off'",
 	} {
 		if !strings.Contains(conf, want) {
 			t.Fatalf("missing %q in:\n%s", want, conf)
 		}
+	}
+}
+
+func TestParseTargetTime(t *testing.T) {
+	now := time.Date(2026, 10, 28, 15, 0, 21, 0, time.UTC)
+	if _, err := parseTargetTime("2026-10-28T15:30:00Z", now); err == nil {
+		t.Fatal("expected a future target time to be rejected")
+	}
+	if _, err := parseTargetTime("2026-10-28 14:30", now); err == nil {
+		t.Fatal("expected a non-RFC3339 value to be rejected")
+	}
+	got, err := parseTargetTime("2026-10-28T15:30:00+01:00", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := postgresTargetTime(got); s != "2026-10-28 14:30:00+00" {
+		t.Fatalf("postgresTargetTime = %q", s)
+	}
+	if s := postgresTargetTime(time.Date(2026, 10, 28, 14, 30, 0, 250000000, time.UTC)); s != "2026-10-28 14:30:00.25+00" {
+		t.Fatalf("postgresTargetTime with fraction = %q", s)
 	}
 }
 
