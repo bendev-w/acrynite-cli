@@ -428,7 +428,11 @@ func runDueSchedules(cmd *cobra.Command) error {
 
 var walStorage, walPath, walPushFile, walPushName string
 var walCmd = &cobra.Command{Use: "wal", Short: "Configure PostgreSQL WAL archiving"}
-var walEnableCmd = &cobra.Command{Use: "enable <registered-database-or-cluster>", Short: "Enable cluster-level WAL archiving to S3", Args: cobra.ExactArgs(1), RunE: runWALEnableV2}
+var walEnableCmd = &cobra.Command{Use: "enable <registered-database-or-cluster>", Short: "Enable cluster-level WAL archiving to S3 or a local directory", Long: `Enable cluster-level WAL archiving to S3 (--storage) or a local directory (--path).
+
+Run with sudo on the PostgreSQL host and Acrynite will offer to grant the registered role the
+permissions it needs, give the postgres user access to the WAL directory, and restart PostgreSQL.
+Each step asks first; --yes accepts them all.`, Args: cobra.ExactArgs(1), RunE: runWALEnableV2}
 var walStatusCmd = &cobra.Command{Use: "status <registered-database-or-cluster>", Short: "Show WAL archive status", Args: cobra.ExactArgs(1), RunE: runWALStatusV2}
 var walPushCmd = &cobra.Command{Use: "push <registered-database-or-cluster>", Hidden: true, Args: cobra.ExactArgs(1), RunE: runWALPushV2}
 
@@ -475,8 +479,18 @@ func runWALEnableV2(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	archiveCommand := buildDatabaseArchiveCommand(exe, wd, args[0])
+	admin := localAdmin(cfg)
 	restart, err := wal.EnableArchive(db, archiveCommand, "5min")
+	if err != nil && admin && wal.IsPermissionDenied(err) {
+		if grantErr := offerWALGrants(cmd, db, cfg); grantErr != nil {
+			return fmt.Errorf("%w\n%v", err, grantErr)
+		}
+		restart, err = wal.EnableArchive(db, archiveCommand, "5min")
+	}
 	if err != nil {
+		if !admin && localServer(cfg) && wal.IsPermissionDenied(err) {
+			return fmt.Errorf("%w\nRerun with sudo and Acrynite can grant these permissions for you", err)
+		}
 		return err
 	}
 	c, err := catalog.NewManager()
@@ -486,11 +500,37 @@ func runWALEnableV2(cmd *cobra.Command, args []string) error {
 	if err = c.PutWAL(&catalog.WALConfig{Database: args[0], Storage: locator, EnabledAt: time.Now().UTC()}); err != nil {
 		return err
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "WAL archiving configured for %s to %s", args[0], displayStorage(locator))
-	if restart {
-		fmt.Fprint(cmd.OutOrStdout(), ". Restart PostgreSQL to activate archive_mode")
+	out := cmd.OutOrStdout()
+	fmt.Fprintf(out, "WAL archiving configured for %s to %s\n", args[0], displayStorage(locator))
+	if !admin {
+		if restart {
+			fmt.Fprintln(out, "Restart PostgreSQL to apply the WAL archiving settings (for example: sudo systemctl restart postgresql).")
+		}
+		return nil
 	}
-	fmt.Fprintln(cmd.OutOrStdout())
+	walDir := ""
+	if walPath != "" {
+		walDir = filepath.Join(locator.Artifact, "wal")
+	}
+	problems := prepareArchiverAccess(cmd, exe, wd, walDir)
+	if !restart {
+		return nil
+	}
+	var clusterName string
+	_ = db.QueryRow("SHOW cluster_name").Scan(&clusterName)
+	service := postgresServiceName(clusterName)
+	if len(problems) > 0 {
+		fmt.Fprintf(out, "Not restarting PostgreSQL yet. After fixing the access problems, restart it with: sudo systemctl restart %s\n", service)
+		return nil
+	}
+	if !confirm(cmd, fmt.Sprintf("PostgreSQL must restart to start archiving WAL; this briefly disconnects all clients. Restart %s now?", service)) {
+		fmt.Fprintf(out, "Restart PostgreSQL later to start archiving: sudo systemctl restart %s\n", service)
+		return nil
+	}
+	if err := restartPostgres(cfg, service); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "PostgreSQL restarted; WAL archiving is active. Check progress with: acrynite wal status %s\n", args[0])
 	return nil
 }
 func runWALPushV2(cmd *cobra.Command, args []string) error {
@@ -1161,6 +1201,7 @@ func init() {
 	walCmd.AddCommand(walEnableCmd, walStatusCmd, walPushCmd)
 	walEnableCmd.Flags().StringVar(&walStorage, "storage", "", "Registered S3 storage")
 	walEnableCmd.Flags().StringVar(&walPath, "path", "", "Local directory for WAL files (must be writable by PostgreSQL)")
+	walEnableCmd.Flags().BoolVarP(&walAssumeYes, "yes", "y", false, "Answer yes to every prompt (grant permissions, fix WAL directory ownership, restart PostgreSQL)")
 	walPushCmd.Flags().StringVar(&walPushFile, "file", "", "WAL source file")
 	walPushCmd.Flags().StringVar(&walPushName, "name", "", "WAL segment name")
 	recoveryPointsCmd.AddCommand(recoveryPointsListCmd)
