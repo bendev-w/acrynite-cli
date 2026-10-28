@@ -722,7 +722,11 @@ func runRestoreRun(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 	if restoreBackupID == "" {
-		fmt.Fprintf(cmd.OutOrStdout(), "Selected backup %s (completed %s)\n", m.ID, m.CompletedAt.Format(time.RFC3339))
+		reason := "the newest completed physical backup"
+		if restoreTargetTime != "" {
+			reason = "the newest backup that finished at or before " + restoreTargetTime
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "Selected backup %s (completed %s): %s\n", m.ID, m.CompletedAt.Format(time.RFC3339), reason)
 	}
 	if m.Status != catalog.StatusCompleted {
 		return fmt.Errorf("backup %q is not completed", m.ID)
@@ -891,10 +895,29 @@ func waitForContainer(container string) error {
 		out, err := exec.Command("docker", "inspect", "-f", "{{.State.Running}}", container).Output()
 		if err != nil || strings.TrimSpace(string(out)) != "true" {
 			logs, _ := exec.Command("docker", "logs", "--tail", "20", container).CombinedOutput()
-			return fmt.Errorf("recovery container %q exited during startup:\n%s", container, strings.TrimSpace(string(logs)))
+			return fmt.Errorf("recovery container %q exited during startup:\n%s%s", container, strings.TrimSpace(string(logs)), recoveryFailureHint(string(logs)))
 		}
 	}
 	return nil
+}
+
+var lastReplayedCommit = regexp.MustCompile(`last completed transaction was at log time (\S+ \S+)`)
+
+// recoveryFailureHint explains well-known PostgreSQL recovery failures found in the container log.
+func recoveryFailureHint(logs string) string {
+	if !strings.Contains(logs, "recovery ended before configured recovery target was reached") {
+		return ""
+	}
+	last := "an earlier time"
+	if m := lastReplayedCommit.FindStringSubmatch(logs); m != nil {
+		last = m[1]
+	}
+	return "\n\nThe WAL archive ends before the requested --target-time: its last transaction was committed at " + last + ".\n" +
+		"PostgreSQL stops at a target time only after replaying a transaction committed later than it, and none is archived yet. Either:\n" +
+		"  - archive newer WAL: on the source run \"SELECT pg_current_xact_id();\" (needed if the database has been idle since the target) and then\n" +
+		"    \"SELECT pg_switch_wal();\", wait for 'acrynite wal status' to advance, and retry;\n" +
+		"  - choose a --target-time at or before " + last + "; or\n" +
+		"  - omit --target-time to recover to the latest archived WAL."
 }
 
 func extractBaseBackup(archivePath, dataDir string) error {

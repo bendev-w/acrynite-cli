@@ -104,6 +104,19 @@ func TestParseTargetTime(t *testing.T) {
 	}
 }
 
+func TestRecoveryFailureHint(t *testing.T) {
+	logs := `LOG:  redo done at 0/11000148 system usage: CPU: user: 0.00 s
+LOG:  last completed transaction was at log time 2026-10-28 14:36:39.048345+00
+FATAL:  recovery ended before configured recovery target was reached`
+	hint := recoveryFailureHint(logs)
+	if !strings.Contains(hint, "2026-10-28 14:36:39.048345+00") || !strings.Contains(hint, "pg_switch_wal") {
+		t.Fatalf("unexpected hint: %q", hint)
+	}
+	if recoveryFailureHint("FATAL:  some other failure") != "" {
+		t.Fatal("expected no hint for unrelated failures")
+	}
+}
+
 func TestValidateBundledWAL(t *testing.T) {
 	if err := validateBundledWAL(newRestoredDataDir(t, true)); err != nil {
 		t.Fatal(err)
