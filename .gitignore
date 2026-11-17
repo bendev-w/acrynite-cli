@@ -7,3 +7,5 @@ node_modules/*
 .idea/*
 acrynite.exe
 backups/*
+test-lab/work/
+test-lab/.env

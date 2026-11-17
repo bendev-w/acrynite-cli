@@ -1,0 +1,8 @@
+# These files run inside Linux containers; CRLF would break the shebang and heredocs.
+# Force LF regardless of the host's core.autocrlf setting.
+*.sh        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+Dockerfile  text eol=lf
+.env.example text eol=lf
+lab.sh      text eol=lf
