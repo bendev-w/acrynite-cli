@@ -5,15 +5,20 @@ edge cases to try on purpose, and the tester report form. It targets **physical 
 
 ## Architecture
 
-Five services on one bridge network (`lab`):
+Four services on one bridge network (`lab`):
 
 | Service | Image | Purpose |
 | --- | --- | --- |
-| `minio` | `minio/minio` (pinned) | S3 stand-in; API on `minio:9000` (not published), console on `127.0.0.1:9001` |
-| `minio-init` | `minio/mc` (pinned) | Waits for MinIO, creates the `acrynite-lab` bucket, exits |
+| `localstack` | `localstack/localstack:4` | S3 stand-in; API at `http://localstack:4566`. An init hook creates the `acrynite-lab` bucket when it is ready |
 | `postgres` | built `FROM postgres:17` | The "production" database |
 | `writer` | `postgres:17` | Inserts one `events` row every `WRITE_INTERVAL` seconds |
 | `toolbox` | built (Debian + `postgresql-client-17` + Docker CLI) | Where the tester runs `acrynite` |
+
+**Why LocalStack and not MinIO.** The spec was written for MinIO, but MinIO's Docker Hub
+and quay images now require authentication (`unauthorized: authentication required` on an
+anonymous pull), which breaks the "only Docker installed, no account" promise. LocalStack
+is anonymously pullable and emulates S3 faithfully (including the multipart uploads that
+`pg_basebackup` tars and WAL segments use). Override `S3_IMAGE` in `.env` to swap it.
 
 **The shared-path trick.** `LAB_WORK` is an absolute host path (`$(pwd)/work`, written into
 `.env` by `lab.sh`) bind-mounted at that same absolute path in `postgres` and `toolbox`.
@@ -34,10 +39,10 @@ resolve on the host.
   recovery folder must exist on the host for the bind mount, so `TMPDIR` points inside the
   shared folder.
 - AWS variables on `postgres` and `toolbox`. Storage is registered **without** keys, so the
-  AWS SDK default chain uses `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_REGION`. The
-  keys equal the MinIO root user/password (set by `lab.sh`). If you instead register with
-  `--access-key`/`--secret-key`, the keys land only in the toolbox's secret store and WAL
-  pushes from PostgreSQL fail auth — don't do that in this lab.
+  AWS SDK default chain uses `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_REGION`
+  (LocalStack ignores the values but the SDK requires them set). If you instead register
+  with `--access-key`/`--secret-key`, the keys land only in the toolbox's secret store and
+  WAL pushes from PostgreSQL fail auth — don't do that in this lab.
 
 **Compose rules honoured:** `archive_mode` / `archive_command` / `archive_timeout` are never
 passed with `-c` on the postgres command line (that would override `ALTER SYSTEM` and make
@@ -67,7 +72,7 @@ preflight checks. A permission error the preflight missed is a bug worth reporti
 ### Lab checks
 
 - From a clean clone, `./lab.sh up` finishes in a few minutes with no manual steps.
-- `up` run twice changes nothing; `reset` then `up` gives a fresh lab with no old backups in MinIO.
+- `up` run twice changes nothing; `reset` then `up` gives a fresh lab with no old backups in S3.
 - Nothing listens on `0.0.0.0`: every published port binds to `127.0.0.1`.
 - Host ports come from `.env` (`PG_HOST_PORT`, `MINIO_CONSOLE_PORT`, `RECOVERY_PORT`).
 
@@ -81,8 +86,8 @@ Each makes a good tester report.
   latest point and say so. `--target-time` in the future is rejected outright; a target past
   the last archived WAL produces a clear "WAL archive ends before the requested target"
   message with the last committed time.
-- **Archiving broken on purpose** — `docker compose stop minio` for a minute: `wal status`
-  should show a failed count, and archiving should catch up once MinIO is back.
+- **Archiving broken on purpose** — `docker compose stop localstack` for a minute:
+  `wal status` should show a failed count, and archiving should catch up once it is back.
 - **Writer running through `restart-db`** — no gaps in `seq` once it recovers.
 - **A second restore while `acrynite-lab-recovery` already exists** — the error should name
   the clash and how to fix it.
@@ -91,7 +96,7 @@ Each makes a good tester report.
 
 - **`restore plan` does not yet check WAL coverage** for the requested T — it only checks
   that a WAL destination exists. `break-things.sh` therefore forces a WAL segment switch and
-  waits for it to archive, guaranteeing the WAL covering T is in MinIO before you restore.
+  waits for it to archive, guaranteeing the WAL covering T is in S3 before you restore.
 - **No `--recovery-dir` flag** — `restore run` uses `os.MkdirTemp("", …)`, so the lab relies
   on `TMPDIR` pointing inside `LAB_WORK`.
 - **Direct WAL mode only** on the public `wal enable`. Stream mode exists in the codebase but

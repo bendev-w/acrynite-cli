@@ -6,7 +6,7 @@
 #   ./lab.sh status      Containers, recent writer rows, WAL status
 #   ./lab.sh restart-db  Restart PostgreSQL (needed after `wal enable`)
 #   ./lab.sh down        Stop containers, keep data volumes
-#   ./lab.sh reset       Remove containers + data (pgdata, minio, work/{storage,tmp,home})
+#   ./lab.sh reset       Remove containers + data (pgdata, S3 state, work/{storage,tmp,home})
 #   ./lab.sh destroy     reset + remove the installed binary and built images
 set -eu
 
@@ -54,15 +54,11 @@ ensure_env() {
     [ -f "$EXAMPLE" ] || die "$EXAMPLE is missing."
     cp "$EXAMPLE" "$ENV_FILE"
     echo "Created $ENV_FILE from $EXAMPLE; generating random passwords..."
-    set_env MINIO_ROOT_USER "lab$(gen | cut -c1-12)"
-    set_env MINIO_ROOT_PASSWORD "$(gen)"
     set_env POSTGRES_PASSWORD "$(gen)"
     set_env ACRYNITE_BACKUP_PASSWORD "$(gen)"
     set_env LAB_WRITER_PASSWORD "$(gen)"
   fi
-  # Derived keys, refreshed every up so MinIO root creds and the AWS creds stay in sync.
-  set_env AWS_ACCESS_KEY_ID "$(get_env MINIO_ROOT_USER)"
-  set_env AWS_SECRET_ACCESS_KEY "$(get_env MINIO_ROOT_PASSWORD)"
+  # LAB_WORK must be an absolute host path, refreshed every up (the repo may have moved).
   set_env LAB_WORK "$(pwd)/work"
 }
 
@@ -78,6 +74,19 @@ wait_pg_healthy() {
   echo; die "PostgreSQL did not become healthy in time. See: ./lab.sh status"
 }
 
+wait_bucket() {
+  bucket="$(get_env S3_BUCKET)"; [ -n "$bucket" ] && bucket="$bucket" || bucket="acrynite-lab"
+  printf 'Waiting for the S3 bucket'
+  i=0
+  while [ "$i" -lt 60 ]; do
+    if $COMPOSE exec -T localstack awslocal s3 ls "s3://$bucket" >/dev/null 2>&1; then
+      echo ' ready.'; return 0
+    fi
+    printf '.'; sleep 2; i=$((i + 1))
+  done
+  echo; echo "warning: S3 bucket '$bucket' not confirmed yet; it is created when LocalStack finishes starting."
+}
+
 # ---------- commands ----------
 
 cmd_up() {
@@ -87,11 +96,12 @@ cmd_up() {
   echo "Building and starting the lab..."
   $COMPOSE up -d --build
   wait_pg_healthy
-  # minio-init has already created the bucket (toolbox depends on its success).
+  wait_bucket
   echo
   echo "Lab is up."
-  echo "  MinIO console:   http://127.0.0.1:$(get_env MINIO_CONSOLE_PORT)   (user: $(get_env MINIO_ROOT_USER))"
+  echo "  S3 (LocalStack): http://localstack:4566  (in-network)  ·  127.0.0.1:$(get_env S3_HOST_PORT) (host)"
   echo "  PostgreSQL:      127.0.0.1:$(get_env PG_HOST_PORT)"
+  echo "  Inspect S3:      docker compose exec localstack awslocal s3 ls s3://$(get_env S3_BUCKET) --recursive"
   echo
   echo "Next: ./lab.sh shell"
 }
@@ -107,10 +117,10 @@ cmd_shell() {
      --password "$ACRYNITE_BACKUP_PASSWORD" --ssl-mode disable
    acrynite database test-connection lab
 
-   acrynite storage register minio --provider s3 --bucket acrynite-lab \
-     --prefix lab --region us-east-1 --endpoint http://minio:9000
+   acrynite storage register s3 --provider s3 --bucket acrynite-lab \
+     --prefix lab --region us-east-1 --endpoint http://localstack:4566
 
-   acrynite wal enable lab --storage minio
+   acrynite wal enable lab --storage s3
    exit            # then on the host: ./lab.sh restart-db
 
  Full walkthrough: test-lab/README.md

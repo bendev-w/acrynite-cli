@@ -6,16 +6,20 @@ PostgreSQL client, no AWS account, no real database touched.
 
 The lab proves four things:
 
-1. **Backup** — `acrynite backup run --type physical` uploads a base backup to S3 (MinIO).
-2. **Archiving** — `acrynite wal enable` makes PostgreSQL push WAL segments to MinIO continuously.
+1. **Backup** — `acrynite backup run --type physical` uploads a base backup to S3 (LocalStack).
+2. **Archiving** — `acrynite wal enable` makes PostgreSQL push WAL segments to S3 continuously.
 3. **Recovery** — `acrynite restore run --target-time` recovers into a Docker container whose newest row is at or just before the chosen time.
 4. **Safety** — the source database is untouched throughout.
+
+> **S3 backend:** the lab uses **LocalStack** (a faithful, anonymously pullable S3
+> emulator). MinIO's images now require a Docker Hub / quay login, which would break the
+> "no account needed" promise. To use a different backend, override `S3_IMAGE` in `.env`.
 
 ## Prerequisites
 
 - Docker Engine 24+ or Docker Desktop with Compose v2
-- ~2 GB free disk
-- Ports **55432**, **9001**, and **55433** free (all bound to `127.0.0.1`; change them in `.env`)
+- ~3 GB free disk (the LocalStack image is ~1 GB)
+- Ports **55432**, **4566**, and **55433** free (all bound to `127.0.0.1`; change them in `.env`)
 - On Windows: run everything from **WSL2** so `LAB_WORK` is a Linux path Docker Desktop can mount.
 
 ## How it works (the one trick)
@@ -36,7 +40,7 @@ Use **two terminals**, both in `test-lab/`:
 ### 1. Start the lab — Terminal B
 
 ```sh
-./lab.sh up        # builds images, starts 5 services, generates .env with random passwords
+./lab.sh up        # builds images, starts 4 services, generates .env with random passwords
 ./lab.sh shell     # opens Terminal A in the toolbox
 ```
 
@@ -48,16 +52,17 @@ acrynite database register lab --host postgres --port 5432 \
   --password "$ACRYNITE_BACKUP_PASSWORD" --ssl-mode disable
 acrynite database test-connection lab
 
-acrynite storage register minio --provider s3 --bucket acrynite-lab \
-  --prefix lab --region us-east-1 --endpoint http://minio:9000
+acrynite storage register s3 --provider s3 --bucket acrynite-lab \
+  --prefix lab --region us-east-1 --endpoint http://localstack:4566
 
-acrynite wal enable lab --storage minio
+acrynite wal enable lab --storage s3
 exit               # leave the toolbox shell
 ```
 
 > Storage is registered **without** `--access-key`/`--secret-key` on purpose: Acrynite
 > then uses the AWS environment variables, which are present in both the toolbox and the
-> `postgres` container, so WAL pushes from PostgreSQL authenticate correctly.
+> `postgres` container, so WAL pushes from PostgreSQL authenticate correctly. (LocalStack
+> ignores the credential values, but they must be set for the AWS SDK.)
 
 ### 3. Activate archiving — Terminal B
 
@@ -70,7 +75,7 @@ exit               # leave the toolbox shell
 
 ```sh
 acrynite wal status lab          # repeat until a successful WAL segment appears
-acrynite backup run --database lab --type physical --storage minio
+acrynite backup run --database lab --type physical --storage s3
 # note the backup ID it prints
 ```
 
@@ -110,7 +115,7 @@ Then fill in the **Tester report** in [TESTING.md](TESTING.md#tester-report).
 | `status` | Containers, last 5 writer rows, `acrynite wal status lab` |
 | `restart-db` | Restart PostgreSQL (needed after `wal enable`); shows `archive_mode` |
 | `down` | Stop containers, keep data volumes |
-| `reset` | Remove containers + data (pgdata, MinIO, work/{storage,tmp,home}); keep the binary |
+| `reset` | Remove containers + data (pgdata, S3 state, work/{storage,tmp,home}); keep the binary |
 | `destroy` | `reset` + remove the installed binary and built images |
 
 ## Testing an unreleased build
@@ -128,7 +133,7 @@ ACRYNITE_BINARY=${LAB_WORK}/bin/acrynite
 
 ## Troubleshooting
 
-- **`wal status` shows failures** — make sure you ran `./lab.sh restart-db` after `wal enable`, and that MinIO is up (`./lab.sh status`).
+- **`wal status` shows failures** — make sure you ran `./lab.sh restart-db` after `wal enable`, and that LocalStack is up (`./lab.sh status`).
 - **Nothing archives on an idle DB** — the lab sets `archive_timeout=30s` (via `ARCHIVE_TIMEOUT_LAB`); the writer also keeps WAL flowing.
 - **`restore run` says the container already exists** — remove it (`docker rm -f acrynite-lab-recovery`) or pass a different `--container-name`.
 - **Port clash** — change `PG_HOST_PORT`, `MINIO_CONSOLE_PORT`, or `RECOVERY_PORT` in `.env`, then `./lab.sh up`.

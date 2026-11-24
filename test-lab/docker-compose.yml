@@ -1,12 +1,16 @@
-# Acrynite Test Lab — five services on one bridge network.
+# Acrynite Test Lab — four services on one bridge network.
 #
-# The key trick: LAB_WORK (an absolute HOST path, $(pwd)/work, written into .env
-# by lab.sh) is bind-mounted at that SAME absolute path inside both `postgres` and
+# S3 is provided by LocalStack (http://localstack:4566), a faithful, anonymously
+# pullable S3 emulator. (MinIO's images now require a Docker Hub / quay login, which
+# breaks the "only Docker installed, no account" promise, so the lab uses LocalStack.)
+# Override S3_IMAGE in .env to use a different backend.
+#
+# The key trick: LAB_WORK (an absolute HOST path, $(pwd)/work, written into .env by
+# lab.sh) is bind-mounted at that SAME absolute path inside both `postgres` and
 # `toolbox`. Acrynite's `wal enable` writes an archive_command containing the binary
 # path (os.Executable) and working directory (os.Getwd). Because the path is identical
-# in both containers, PostgreSQL (running as uid 999) can execute the very same binary
-# the tester ran, and the Docker bind mounts `restore run` creates under TMPDIR resolve
-# on the host too.
+# in both containers, PostgreSQL (uid 999) can execute the very same binary the tester
+# ran, and the Docker bind mounts `restore run` creates under TMPDIR resolve on the host.
 #
 # RULE: never pass archive_mode / archive_command / archive_timeout with -c on the
 # postgres command line. Command-line settings override ALTER SYSTEM, which would make
@@ -14,40 +18,26 @@
 name: acrynite-lab
 
 services:
-  minio:
-    image: minio/minio:RELEASE.2024-01-16T16-07-38Z
-    command: server /data --console-address ":9001"
+  localstack:
+    image: ${S3_IMAGE:-localstack/localstack:4}
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      SERVICES: s3
+      DEBUG: "0"
+      # The bucket name, read by the init hook below.
+      BUCKET: ${S3_BUCKET:-acrynite-lab}
     volumes:
-      - minio-data:/data
+      # Creates the bucket automatically once LocalStack is ready.
+      - ./localstack/init-bucket.sh:/etc/localstack/init/ready.d/init-bucket.sh:ro
     ports:
-      # Console only. The S3 API (9000) is NOT published; it is reached in-network at http://minio:9000.
-      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+      # Published for optional host inspection; the API is reached in-network at http://localstack:4566.
+      - "127.0.0.1:${S3_HOST_PORT:-4566}:4566"
     networks: [lab]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
     restart: unless-stopped
-
-  minio-init:
-    image: minio/mc:RELEASE.2024-01-18T07-03-39Z
-    depends_on:
-      minio:
-        condition: service_started
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-      MINIO_BUCKET: ${MINIO_BUCKET:-acrynite-lab}
-    # Waits for MinIO, creates the bucket, then exits. Other services gate on its success.
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        until mc alias set lab http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; do
-          echo "waiting for minio..."; sleep 1;
-        done
-        mc mb --ignore-existing "lab/$$MINIO_BUCKET"
-        echo "bucket $$MINIO_BUCKET ready"
-    networks: [lab]
-    restart: "no"
 
   postgres:
     build:
@@ -57,9 +47,10 @@ services:
       # Read by the initdb .sh scripts to set role passwords.
       ACRYNITE_BACKUP_PASSWORD: ${ACRYNITE_BACKUP_PASSWORD}
       LAB_WRITER_PASSWORD: ${LAB_WRITER_PASSWORD}
-      # archive_command inherits these: the S3 (MinIO) credentials for `acrynite wal push`.
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      # archive_command inherits these: the S3 (LocalStack) credentials for `acrynite wal push`.
+      # LocalStack accepts any non-empty credentials; the SDK just needs them present.
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
       AWS_REGION: ${AWS_REGION:-us-east-1}
       AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
       # gosu preserves the environment, so the postmaster (and thus archive_command) sees this HOME.
@@ -105,16 +96,16 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      minio-init:
-        condition: service_completed_successfully
+      localstack:
+        condition: service_healthy
     environment:
       LAB_WORK: ${LAB_WORK}
       # restore run uses os.MkdirTemp("", ...): TMPDIR must be inside LAB_WORK so the recovery
       # folder exists on the host for the bind mount into the recovery container.
       TMPDIR: ${LAB_WORK}/tmp
       HOME: ${LAB_WORK}/home
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
       AWS_REGION: ${AWS_REGION:-us-east-1}
       AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
       ACRYNITE_VERSION: ${ACRYNITE_VERSION:-latest}
@@ -134,4 +125,3 @@ networks:
 
 volumes:
   pgdata:
-  minio-data:

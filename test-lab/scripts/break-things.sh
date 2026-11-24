@@ -1,5 +1,5 @@
 #!/bin/sh
-# Simulates data loss, then forces a WAL segment switch and waits for it to reach MinIO,
+# Simulates data loss, then forces a WAL segment switch and waits for it to reach S3,
 # so the WAL covering the chosen target time T is archived before any restore.
 # (restore plan cannot yet check WAL coverage itself, so this guarantees it.)
 #
@@ -40,6 +40,6 @@ while [ "$i" -lt 60 ]; do
 done
 
 echo
-echo "WARNING: last_archived_wal did not advance. Is WAL archiving enabled and MinIO up?"
+echo "WARNING: last_archived_wal did not advance. Is WAL archiving enabled and LocalStack up?"
 echo "Check: ./lab.sh status"
 exit 1
