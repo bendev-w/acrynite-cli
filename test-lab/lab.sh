@@ -41,7 +41,7 @@ set_env() {
   if [ -f "$ENV_FILE" ] && grep -q "^${_k}=" "$ENV_FILE"; then
     grep -v "^${_k}=" "$ENV_FILE" > "$_tmp"
     printf '%s=%s\n' "$_k" "$_v" >> "$_tmp"
-    mv "$_tmp" "$ENV_FILE"
+    mv -f "$_tmp" "$ENV_FILE"
   else
     printf '%s=%s\n' "$_k" "$_v" >> "$ENV_FILE"
   fi
